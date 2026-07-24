@@ -8,6 +8,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -a -o manager ./cmd/main.go
 
 FROM gcr.io/distroless/static:nonroot
+LABEL org.opencontainers.image.source="https://github.com/kube-workspaces/controller"
 WORKDIR /
 COPY --from=builder /workspace/manager .
 USER 65532:65532
