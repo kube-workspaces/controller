@@ -80,6 +80,15 @@ The controller requires a ClusterRole with permissions for:
 - `core/pods/log` - get
 - `core/events` - get, list, watch
 
+## Related Repositories
+
+| Repository | Description |
+|------------|-------------|
+| [kube-workspaces/api](https://github.com/kube-workspaces/api) | REST API service |
+| [kube-workspaces/proxy](https://github.com/kube-workspaces/proxy) | Workspace reverse proxy |
+| [kube-workspaces/frontend](https://github.com/kube-workspaces/frontend) | Next.js web UI |
+| [kube-workspaces/deploy](https://github.com/kube-workspaces/deploy) | Deployment manifests and documentation |
+
 ## License
 
 Apache License 2.0
