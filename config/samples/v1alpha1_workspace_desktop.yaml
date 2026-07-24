@@ -1,0 +1,31 @@
+apiVersion: kubeworkspaces.io/v1alpha1
+kind: Workspace
+metadata:
+  name: debian-desktop-example
+  namespace: workspaces
+  labels:
+    app.kubernetes.io/name: kube-workspaces-controller
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  template:
+    spec:
+      containers:
+        - name: debian-desktop-example
+          image: flaccid/debian-desktop:latest
+          ports:
+            - containerPort: 6080
+              name: workspace-port
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "4"
+              memory: "4Gi"
+          volumeMounts:
+            - name: workspace
+              mountPath: /home/user
+      volumes:
+        - name: workspace
+          emptyDir: {}

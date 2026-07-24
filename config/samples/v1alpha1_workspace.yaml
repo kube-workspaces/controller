@@ -1,0 +1,31 @@
+apiVersion: kubeworkspaces.io/v1alpha1
+kind: Workspace
+metadata:
+  name: code-server-example
+  namespace: workspaces
+  labels:
+    app.kubernetes.io/name: kube-workspaces-controller
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  template:
+    spec:
+      containers:
+        - name: code-server-example
+          image: codercom/code-server:latest
+          ports:
+            - containerPort: 8080
+              name: workspace-port
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: workspace
+              mountPath: /home/coder
+      volumes:
+        - name: workspace
+          emptyDir: {}
