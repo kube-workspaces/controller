@@ -51,6 +51,10 @@ const (
 	AnnotationUserEmail = "kubeworkspaces.io/user-email"
 	// AnnotationNamespaceEnabled marks a namespace as enabled for workspace filtering.
 	AnnotationNamespaceEnabled = "kubeworkspaces.io/namespace-enabled"
+	// ManagedByValue is the value used for the managed-by label.
+	ManagedByValue = "user-controller"
+	// LabelValueTrue is the string "true" used in labels.
+	LabelValueTrue = "true"
 )
 
 // UserReconciler reconciles a User object.
@@ -199,9 +203,9 @@ func (r *UserReconciler) reconcilePersonalNamespace(ctx context.Context, user *k
 		if ns.Labels == nil {
 			ns.Labels = make(map[string]string)
 		}
-		ns.Labels[LabelPersonalNamespace] = "true"
+		ns.Labels[LabelPersonalNamespace] = LabelValueTrue
 		ns.Labels[LabelUserName] = user.Name
-		ns.Labels[LabelManagedByUser] = "user-controller"
+		ns.Labels[LabelManagedByUser] = ManagedByValue
 
 		// Apply additional labels from config
 		for k, v := range nsConfig.Labels {
@@ -213,7 +217,7 @@ func (r *UserReconciler) reconcilePersonalNamespace(ctx context.Context, user *k
 		}
 		ns.Annotations[AnnotationUserEmail] = user.Spec.Email
 		// Ensure personal namespace is enabled for workspace filtering
-		ns.Annotations[AnnotationNamespaceEnabled] = "true"
+		ns.Annotations[AnnotationNamespaceEnabled] = LabelValueTrue
 		// Apply additional annotations from config
 		for k, v := range nsConfig.Annotations {
 			ns.Annotations[k] = v
@@ -272,7 +276,7 @@ func (r *UserReconciler) ensureRoleBinding(ctx context.Context, user *kubeworksp
 		if rb.Labels == nil {
 			rb.Labels = make(map[string]string)
 		}
-		rb.Labels[LabelManagedByUser] = "user-controller"
+		rb.Labels[LabelManagedByUser] = ManagedByValue
 		rb.Labels[LabelUserName] = user.Name
 
 		if rb.Annotations == nil {
@@ -308,7 +312,7 @@ func (r *UserReconciler) ensureResourceQuota(ctx context.Context, user *kubework
 		if rq.Labels == nil {
 			rq.Labels = make(map[string]string)
 		}
-		rq.Labels[LabelManagedByUser] = "user-controller"
+		rq.Labels[LabelManagedByUser] = ManagedByValue
 		rq.Labels[LabelUserName] = user.Name
 
 		hard := make(corev1.ResourceList)
@@ -325,7 +329,7 @@ func (r *UserReconciler) cleanupStaleRoleBindings(ctx context.Context, user *kub
 	// List all RoleBindings managed by this user
 	var rbList rbacv1.RoleBindingList
 	if err := r.List(ctx, &rbList, client.MatchingLabels{
-		LabelManagedByUser: "user-controller",
+		LabelManagedByUser: ManagedByValue,
 		LabelUserName:      user.Name,
 	}); err != nil {
 		return err
@@ -359,7 +363,7 @@ func (r *UserReconciler) cleanupUser(ctx context.Context, user *kubeworkspacesio
 	// Remove all RoleBindings managed by this user
 	var rbList rbacv1.RoleBindingList
 	if err := r.List(ctx, &rbList, client.MatchingLabels{
-		LabelManagedByUser: "user-controller",
+		LabelManagedByUser: ManagedByValue,
 		LabelUserName:      user.Name,
 	}); err != nil {
 		return err

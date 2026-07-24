@@ -91,7 +91,7 @@ var _ = Describe("User Controller", func() {
 				NamespacedName: types.NamespacedName{Name: userName},
 			})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(result.Requeue).To(BeTrue())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 
 			// Verify finalizer was added
 			updatedUser := &kubeworkspacesiov1alpha1.User{}
@@ -128,7 +128,7 @@ var _ = Describe("User Controller", func() {
 				NamespacedName: types.NamespacedName{Name: userName},
 			})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(result.Requeue).To(BeFalse())
+			Expect(result.RequeueAfter).To(BeZero())
 		})
 
 		It("should return not-found error gracefully for non-existent user", func() {
@@ -637,14 +637,6 @@ var _ = Describe("User Controller", func() {
 		})
 	})
 })
-
-// ignoreNotFound is a helper for test cleanup that ignores not-found errors.
-func ignoreNotFound(err error) error {
-	if errors.IsNotFound(err) {
-		return nil
-	}
-	return err
-}
 
 // Ensure unused import is used.
 var _ = context.Background

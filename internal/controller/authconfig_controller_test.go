@@ -155,8 +155,8 @@ var _ = Describe("AuthConfig Controller", func() {
 			oidcServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/.well-known/openid-configuration" {
 					w.Header().Set("Content-Type", "application/json")
-					fmt.Fprintf(w, `{"issuer": "%s", "authorization_endpoint": "%s/auth", "token_endpoint": "%s/token"}`,
-						oidcServer.URL, oidcServer.URL, oidcServer.URL)
+				fmt.Fprintf(w, `{"issuer": "%s", "authorization_endpoint": "%s/auth", "token_endpoint": "%s/token"}`, //nolint:errcheck
+					oidcServer.URL, oidcServer.URL, oidcServer.URL)
 					return
 				}
 				http.NotFound(w, r)

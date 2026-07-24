@@ -69,6 +69,8 @@ type WorkspaceReconciler struct {
 // Reconcile is the main reconciliation loop for Workspace resources.
 // It ensures a StatefulSet and Service exist for each Workspace CR and
 // keeps the status up to date.
+//
+//nolint:gocyclo
 func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	reconcileStart := time.Now()
 	log := logf.FromContext(ctx)
@@ -316,13 +318,13 @@ func generateStatefulSet(instance *kubeworkspacesiov1alpha1.Workspace) *appsv1.S
 
 	// Copy workspace labels to the pod template
 	for k, v := range instance.Labels {
-		ss.Spec.Template.ObjectMeta.Labels[k] = v
+		ss.Spec.Template.Labels[k] = v
 	}
 
 	// Copy relevant workspace annotations to the pod template
 	for k, v := range instance.Annotations {
 		if k != AnnotationStopped {
-			ss.Spec.Template.ObjectMeta.Annotations[k] = v
+			ss.Spec.Template.Annotations[k] = v
 		}
 	}
 
@@ -330,7 +332,7 @@ func generateStatefulSet(instance *kubeworkspacesiov1alpha1.Workspace) *appsv1.S
 	podSpec := &ss.Spec.Template.Spec
 	if len(podSpec.Containers) > 0 {
 		container := &podSpec.Containers[0]
-		if container.Ports == nil || len(container.Ports) == 0 || container.Ports[0].ContainerPort == 0 {
+		if len(container.Ports) == 0 || container.Ports[0].ContainerPort == 0 {
 			container.Ports = []corev1.ContainerPort{
 				{
 					ContainerPort: DefaultContainerPort,
@@ -352,7 +354,7 @@ func generateService(instance *kubeworkspacesiov1alpha1.Workspace) *corev1.Servi
 
 	if len(instance.Spec.Template.Spec.Containers) > 0 {
 		containerPorts := instance.Spec.Template.Spec.Containers[0].Ports
-		if containerPorts != nil && len(containerPorts) > 0 && containerPorts[0].ContainerPort > 0 {
+		if len(containerPorts) > 0 && containerPorts[0].ContainerPort > 0 {
 			// First port maps to Service port 80 (backward compatible)
 			servicePorts = append(servicePorts, corev1.ServicePort{
 				Name:       "http",

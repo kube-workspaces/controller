@@ -152,7 +152,7 @@ func (r *AuthConfigReconciler) verifyIssuer(ctx context.Context, issuerURL strin
 		log.Info("OIDC issuer unreachable", "url", wellKnownURL, "error", err.Error())
 		return false
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
 		log.Info("OIDC issuer returned non-200", "url", wellKnownURL, "status", resp.StatusCode)
