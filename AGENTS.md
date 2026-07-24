@@ -51,4 +51,4 @@ make run         # run controller locally
 
 ## Docker Image
 
-Published to: `kubeworkspaces/controller`
+Published to: `ghcr.io/kube-workspaces/controller`
