@@ -1,5 +1,13 @@
 # Kube Workspaces Controller
 
+![License](https://img.shields.io/github/license/kube-workspaces/controller)
+![Go Version](https://img.shields.io/github/go-mod/go-version/kube-workspaces/controller)
+![Release](https://img.shields.io/github/v/release/kube-workspaces/controller)
+![Tests](https://img.shields.io/github/actions/workflow/status/kube-workspaces/controller/test.yml?label=tests)
+![E2E Tests](https://img.shields.io/github/actions/workflow/status/kube-workspaces/controller/test-e2e.yml?label=e2e)
+![Lint](https://img.shields.io/github/actions/workflow/status/kube-workspaces/controller/lint.yml?label=lint)
+![Docker Image](https://img.shields.io/github/actions/workflow/status/kube-workspaces/controller/docker.yml?label=docker)
+
 Kubernetes controller that manages the lifecycle of `Workspace` custom resources.
 
 ## Overview
