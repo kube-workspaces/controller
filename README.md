@@ -1,4 +1,4 @@
-# kube-workspaces-controller
+# Kube Workspaces Controller
 
 Kubernetes controller that manages the lifecycle of `Workspace` custom resources.
 
