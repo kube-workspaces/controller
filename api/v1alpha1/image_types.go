@@ -160,7 +160,19 @@ type ImageProxyConfig struct {
 	// InjectBaseTag: inject a <base> tag into HTML responses.
 	// +optional
 	InjectBaseTag bool `json:"injectBaseTag,omitempty"`
-	// TLSInsecure: connect to backend over HTTPS with skip-verify (for self-signed certs).
+	// Scheme: URL scheme the proxy uses to reach the workspace backend.
+	// Defaults to "http" when empty.
+	// +kubebuilder:validation:Enum=http;https
+	// +optional
+	Scheme string `json:"scheme,omitempty"`
+	// TLSSkipVerify: when connecting over HTTPS, do not verify the backend's
+	// certificate. Required for workspaces serving self-signed certificates.
+	// +optional
+	TLSSkipVerify bool `json:"tlsSkipVerify,omitempty"`
+	// TLSInsecure: Deprecated: this conflated scheme selection with certificate
+	// verification, making "HTTPS with a valid CA" impossible to express. Use
+	// scheme: https plus tlsSkipVerify instead. Still honoured as a fallback when
+	// scheme is unset: it implies both HTTPS and skip-verify.
 	// +optional
 	TLSInsecure bool `json:"tlsInsecure,omitempty"`
 	// PreservePathPrefix: forward the full proxy path (including /proxy/{ns}/{name}) to the
