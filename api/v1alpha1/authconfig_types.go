@@ -123,6 +123,30 @@ type AuthorizationConfig struct {
 	RestrictNamespaceAccess bool `json:"restrictNamespaceAccess,omitempty"`
 }
 
+// BootstrapAdminConfig defines auto-creation of the default local admin user.
+type BootstrapAdminConfig struct {
+	// Email is the identifier used for the auto-created admin user.
+	// +optional
+	// +kubebuilder:default="admin@local"
+	Email string `json:"email,omitempty"`
+	// Skip disables auto-creation of the bootstrap admin user, e.g. when an
+	// admin user has already been provisioned manually.
+	// +optional
+	Skip bool `json:"skip,omitempty"`
+}
+
+// LocalAuthConfig defines local (username/password) authentication behavior.
+// LocalAuth may be enabled independently of, or alongside, OIDC.
+type LocalAuthConfig struct {
+	// Enabled controls whether local username/password authentication is available.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+	// BootstrapAdmin configures auto-creation of a default admin user when local
+	// auth is first enabled.
+	// +optional
+	BootstrapAdmin *BootstrapAdminConfig `json:"bootstrapAdmin,omitempty"`
+}
+
 // AuthConfigSpec defines the desired state of AuthConfig.
 type AuthConfigSpec struct {
 	// Enabled is the master switch for authentication. When false, the system operates without auth.
@@ -147,6 +171,10 @@ type AuthConfigSpec struct {
 	// Used for bootstrapping admin access.
 	// +optional
 	AdminEmails []string `json:"adminEmails,omitempty"`
+	// LocalAuth configures local username/password authentication. It may be
+	// enabled independently of, or alongside, OIDC.
+	// +optional
+	LocalAuth *LocalAuthConfig `json:"localAuth,omitempty"`
 }
 
 // AuthConfigStatus defines the observed state of AuthConfig.

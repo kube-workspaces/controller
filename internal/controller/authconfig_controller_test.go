@@ -24,6 +24,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -87,15 +88,15 @@ var _ = Describe("AuthConfig Controller", func() {
 		})
 	})
 
-	Context("When auth is enabled but OIDC config is missing", func() {
-		It("should set Ready condition to False with MissingOIDCConfig reason", func() {
+	Context("When auth is enabled but no authentication method is configured", func() {
+		It("should set Ready condition to False with MissingAuthMethod reason", func() {
 			authConfig := &kubeworkspacesiov1alpha1.AuthConfig{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: authConfigName,
 				},
 				Spec: kubeworkspacesiov1alpha1.AuthConfigSpec{
 					Enabled: true,
-					// No OIDC config
+					// No OIDC config, no localAuth
 				},
 			}
 			Expect(k8sClient.Create(ctx, authConfig)).To(Succeed())
@@ -113,7 +114,7 @@ var _ = Describe("AuthConfig Controller", func() {
 			Expect(updated.Status.Conditions).To(HaveLen(1))
 			Expect(updated.Status.Conditions[0].Type).To(Equal("Ready"))
 			Expect(updated.Status.Conditions[0].Status).To(Equal(metav1.ConditionFalse))
-			Expect(updated.Status.Conditions[0].Reason).To(Equal("MissingOIDCConfig"))
+			Expect(updated.Status.Conditions[0].Reason).To(Equal("MissingAuthMethod"))
 		})
 
 		It("should detect empty issuer URL as missing config", func() {
@@ -143,7 +144,124 @@ var _ = Describe("AuthConfig Controller", func() {
 
 			updated := &kubeworkspacesiov1alpha1.AuthConfig{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: authConfigName}, updated)).To(Succeed())
-			Expect(updated.Status.Conditions[0].Reason).To(Equal("MissingOIDCConfig"))
+			Expect(updated.Status.Conditions[0].Reason).To(Equal("MissingAuthMethod"))
+		})
+	})
+
+	Context("When auth is enabled with only localAuth configured (no OIDC)", func() {
+		It("should set Ready condition to True with LocalAuthOnly reason and create the bootstrap admin", func() {
+			authConfig := &kubeworkspacesiov1alpha1.AuthConfig{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: authConfigName,
+				},
+				Spec: kubeworkspacesiov1alpha1.AuthConfigSpec{
+					Enabled: true,
+					LocalAuth: &kubeworkspacesiov1alpha1.LocalAuthConfig{
+						Enabled: true,
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, authConfig)).To(Succeed())
+
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: authConfigName},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
+
+			updated := &kubeworkspacesiov1alpha1.AuthConfig{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: authConfigName}, updated)).To(Succeed())
+			Expect(updated.Status.Conditions[0].Type).To(Equal("Ready"))
+			Expect(updated.Status.Conditions[0].Status).To(Equal(metav1.ConditionTrue))
+			Expect(updated.Status.Conditions[0].Reason).To(Equal("LocalAuthOnly"))
+
+			// Bootstrap admin User should have been created
+			bootstrapUser := &kubeworkspacesiov1alpha1.User{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "admin-at-local"}, bootstrapUser)).To(Succeed())
+			Expect(bootstrapUser.Spec.Email).To(Equal(DefaultBootstrapAdminEmail))
+			Expect(bootstrapUser.Spec.Role).To(Equal(kubeworkspacesiov1alpha1.UserRoleAdmin))
+			Expect(bootstrapUser.Spec.LocalAuth).NotTo(BeNil())
+			Expect(bootstrapUser.Spec.LocalAuth.Enabled).To(BeTrue())
+			Expect(bootstrapUser.Spec.LocalAuth.MustChangePassword).To(BeTrue())
+
+			// Password secret should exist with a bcrypt hash and plaintext password
+			secret := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      "kw-user-admin-at-local-local-auth",
+				Namespace: LocalAuthSystemNamespace,
+			}, secret)).To(Succeed())
+			Expect(secret.Data).To(HaveKey(PasswordSecretHashKey))
+			Expect(secret.Data).To(HaveKey(PasswordSecretPlaintextKey))
+
+			// Clean up created resources
+			_ = k8sClient.Delete(ctx, bootstrapUser)
+			_ = k8sClient.Delete(ctx, secret)
+		})
+
+		It("should not overwrite an existing bootstrap admin on repeated reconciles", func() {
+			authConfig := &kubeworkspacesiov1alpha1.AuthConfig{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: authConfigName,
+				},
+				Spec: kubeworkspacesiov1alpha1.AuthConfigSpec{
+					Enabled: true,
+					LocalAuth: &kubeworkspacesiov1alpha1.LocalAuthConfig{
+						Enabled: true,
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, authConfig)).To(Succeed())
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: authConfigName}})
+			Expect(err).NotTo(HaveOccurred())
+
+			secretBefore := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      "kw-user-admin-at-local-local-auth",
+				Namespace: LocalAuthSystemNamespace,
+			}, secretBefore)).To(Succeed())
+			hashBefore := string(secretBefore.Data[PasswordSecretHashKey])
+
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: authConfigName}})
+			Expect(err).NotTo(HaveOccurred())
+
+			secretAfter := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      "kw-user-admin-at-local-local-auth",
+				Namespace: LocalAuthSystemNamespace,
+			}, secretAfter)).To(Succeed())
+			Expect(string(secretAfter.Data[PasswordSecretHashKey])).To(Equal(hashBefore))
+
+			bootstrapUser := &kubeworkspacesiov1alpha1.User{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "admin-at-local"}, bootstrapUser)).To(Succeed())
+
+			_ = k8sClient.Delete(ctx, bootstrapUser)
+			_ = k8sClient.Delete(ctx, secretAfter)
+		})
+
+		It("should skip bootstrap admin creation when Skip is set", func() {
+			authConfig := &kubeworkspacesiov1alpha1.AuthConfig{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: authConfigName,
+				},
+				Spec: kubeworkspacesiov1alpha1.AuthConfigSpec{
+					Enabled: true,
+					LocalAuth: &kubeworkspacesiov1alpha1.LocalAuthConfig{
+						Enabled: true,
+						BootstrapAdmin: &kubeworkspacesiov1alpha1.BootstrapAdminConfig{
+							Skip: true,
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, authConfig)).To(Succeed())
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: authConfigName}})
+			Expect(err).NotTo(HaveOccurred())
+
+			bootstrapUser := &kubeworkspacesiov1alpha1.User{}
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "admin-at-local"}, bootstrapUser)
+			Expect(err).To(HaveOccurred())
 		})
 	})
 

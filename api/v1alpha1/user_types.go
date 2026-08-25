@@ -39,6 +39,22 @@ type NamespaceAccessEntry struct {
 	Role UserRole `json:"role"`
 }
 
+// LocalAuthSpec defines local (username/password) authentication for a user.
+type LocalAuthSpec struct {
+	// Enabled controls whether this user may authenticate with a local password,
+	// in addition to any other configured authentication method (e.g. OIDC).
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+	// PasswordSecretRef references the Secret and key holding the bcrypt password
+	// hash for this user (key is conventionally "passwordHash").
+	// +optional
+	PasswordSecretRef SecretKeyRef `json:"passwordSecretRef,omitempty"`
+	// MustChangePassword indicates the user must set a new password before
+	// continuing to use the system. Set on creation/reset, cleared on change.
+	// +optional
+	MustChangePassword bool `json:"mustChangePassword,omitempty"`
+}
+
 // UserSpec defines the desired state of User.
 type UserSpec struct {
 	// Email is the unique identifier for the user (immutable).
@@ -60,6 +76,10 @@ type UserSpec struct {
 	// NamespaceAccess defines additional shared namespace grants beyond the personal namespace.
 	// +optional
 	NamespaceAccess []NamespaceAccessEntry `json:"namespaceAccess,omitempty"`
+	// LocalAuth configures local username/password authentication for this user.
+	// May be set alongside other authentication methods (e.g. OIDC) for the same identity.
+	// +optional
+	LocalAuth *LocalAuthSpec `json:"localAuth,omitempty"`
 }
 
 // UserStatus defines the observed state of User.
@@ -76,6 +96,14 @@ type UserStatus struct {
 	// LoginCount is the number of times the user has logged in.
 	// +optional
 	LoginCount int64 `json:"loginCount,omitempty"`
+	// FailedLoginAttempts is the number of consecutive failed local login attempts.
+	// Reset to 0 on successful login.
+	// +optional
+	FailedLoginAttempts int `json:"failedLoginAttempts,omitempty"`
+	// LockedUntil, if set and in the future, indicates local login is temporarily
+	// disabled due to repeated failed attempts.
+	// +optional
+	LockedUntil *metav1.Time `json:"lockedUntil,omitempty"`
 	// Conditions represent the latest available observations of the User's state.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`

@@ -45,6 +45,8 @@ type AuthConfigReconciler struct {
 // +kubebuilder:rbac:groups=kubeworkspaces.io,resources=authconfigs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kubeworkspaces.io,resources=authconfigs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=kubeworkspaces.io,resources=authconfigs/finalizers,verbs=update
+// +kubebuilder:rbac:groups=kubeworkspaces.io,resources=users,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create,namespace=kube-workspaces-system
 
 func (r *AuthConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -83,20 +85,48 @@ func (r *AuthConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, nil
 	}
 
-	// Validate OIDC configuration
-	if authConfig.Spec.OIDC == nil || authConfig.Spec.OIDC.IssuerURL == "" {
+	// Validate that at least one authentication method is configured
+	hasOIDC := authConfig.Spec.OIDC != nil && authConfig.Spec.OIDC.IssuerURL != ""
+	hasLocalAuth := authConfig.Spec.LocalAuth != nil && authConfig.Spec.LocalAuth.Enabled
+	if !hasOIDC && !hasLocalAuth {
 		condition := metav1.Condition{
 			Type:               "Ready",
 			Status:             metav1.ConditionFalse,
 			LastTransitionTime: metav1.Now(),
-			Reason:             "MissingOIDCConfig",
-			Message:            "OIDC configuration is required when auth is enabled",
+			Reason:             "MissingAuthMethod",
+			Message:            "Either OIDC or localAuth must be configured when auth is enabled",
 		}
 		setCondition(&authConfig.Status.Conditions, condition)
 		if err := r.Status().Update(ctx, &authConfig); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	// Reconcile the local-auth bootstrap admin user, independent of OIDC.
+	if hasLocalAuth {
+		if err := r.reconcileBootstrapAdmin(ctx, &authConfig); err != nil {
+			log.Error(err, "failed to reconcile bootstrap admin user")
+			r.EventRecorder.Event(&authConfig, "Warning", "BootstrapAdminFailed", err.Error())
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+	}
+
+	// If OIDC is not configured, there is no issuer to verify; report ready
+	// based on local auth alone.
+	if !hasOIDC {
+		condition := metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionTrue,
+			LastTransitionTime: metav1.Now(),
+			Reason:             "LocalAuthOnly",
+			Message:            "Authentication is enabled via local auth (no OIDC configured)",
+		}
+		setCondition(&authConfig.Status.Conditions, condition)
+		if err := r.Status().Update(ctx, &authConfig); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 	}
 
 	// Verify OIDC issuer is reachable
