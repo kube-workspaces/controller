@@ -19,8 +19,11 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
+	// Aliased: the k8s apimachinery "runtime" is already imported below.
+	goruntime "runtime"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -55,6 +58,25 @@ func init() {
 }
 
 // nolint:gocyclo
+// Build information, injected at link time:
+//
+//	go build -ldflags "-X main.version=v1.2.3 -X main.commit=abc1234 -X main.buildDate=..."
+//
+// runtime/debug.ReadBuildInfo cannot substitute for this: it reports "(devel)"
+// for a build that is not driven by `go install module@version`, which is the
+// case for the container build.
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildDate = "unknown"
+)
+
+// versionString renders the build information for logs and the -version flag.
+func versionString() string {
+	return fmt.Sprintf("%s (commit %s, built %s, %s/%s, %s)",
+		version, commit, buildDate, goruntime.GOOS, goruntime.GOARCH, goruntime.Version())
+}
+
 func main() {
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
@@ -85,9 +107,22 @@ func main() {
 		Development: true,
 	}
 	opts.BindFlags(flag.CommandLine)
+	showVersion := flag.Bool("version", false, "print version information and exit")
 	flag.Parse()
 
+	if *showVersion {
+		fmt.Println(versionString())
+		return
+	}
+
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// Log the build up front, so a pod can be identified from its logs alone
+	// without inspecting the image digest.
+	setupLog.Info("starting kube-workspaces-controller",
+		"version", version, "commit", commit, "buildDate", buildDate,
+		"go", goruntime.Version(),
+		"platform", fmt.Sprintf("%s/%s", goruntime.GOOS, goruntime.GOARCH))
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
