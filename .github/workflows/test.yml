@@ -20,4 +20,5 @@ jobs:
       - name: Running Tests
         run: |
           go mod tidy
+          git diff --exit-code -- go.mod go.sum
           make test
