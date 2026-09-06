@@ -8076,6 +8076,19 @@ spec:
                 required:
                 - spec
                 type: object
+              type:
+                default: container
+                description: |-
+                  Type selects the workload used to run the workspace.
+                  "container" (default) runs the pod template as a StatefulSet.
+                  "scratch" runs it as a plain Deployment (no persistent identity).
+                  "vm" runs it as a KubeVirt VirtualMachine; the main container image must be
+                  a containerDisk image containing a bootable guest disk.
+                enum:
+                - container
+                - vm
+                - scratch
+                type: string
             required:
             - template
             type: object

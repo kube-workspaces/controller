@@ -20,13 +20,17 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
@@ -48,7 +52,24 @@ const (
 	AnnotationStopped = "kubeworkspaces.io/stopped"
 	// LabelWorkspaceName is the label applied to pods to identify the workspace
 	LabelWorkspaceName = "workspace-name"
+	// LabelKubevirtVM is set by KubeVirt on virt-launcher pods, naming the VMI
+	LabelKubevirtVM = "vm.kubevirt.io/name"
 )
+
+// Workspace workload types (spec.type).
+const (
+	WorkspaceTypeContainer = "container"
+	WorkspaceTypeVM        = "vm"
+	WorkspaceTypeScratch   = "scratch"
+)
+
+// kubeVirtVirtualMachineGVK identifies KubeVirt VirtualMachine objects without
+// importing the KubeVirt API module (the controller manages them unstructured).
+var kubeVirtVirtualMachineGVK = schema.GroupVersionKind{
+	Group:   "kubevirt.io",
+	Version: "v1",
+	Kind:    "VirtualMachine",
+}
 
 // WorkspaceReconciler reconciles a Workspace object
 type WorkspaceReconciler struct {
@@ -65,9 +86,13 @@ type WorkspaceReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=events,verbs=get;list;watch;create;patch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstances,verbs=get;list;watch
 
 // Reconcile is the main reconciliation loop for Workspace resources.
-// It ensures a StatefulSet and Service exist for each Workspace CR and
+// It ensures the workload matching the workspace type (StatefulSet, Deployment
+// or KubeVirt VirtualMachine) plus a Service exist for each Workspace CR and
 // keeps the status up to date.
 //
 //nolint:gocyclo
@@ -93,86 +118,63 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, nil
 	}
 
-	// Reconcile StatefulSet
-	ss := generateStatefulSet(instance)
-	if err := ctrl.SetControllerReference(instance, ss, r.Scheme); err != nil {
-		return ctrl.Result{}, err
-	}
+	wsType := workspaceTypeOf(instance)
 
-	foundStateful := &appsv1.StatefulSet{}
-	justCreated := false
-	err := r.Get(ctx, types.NamespacedName{Name: ss.Name, Namespace: ss.Namespace}, foundStateful)
-	if err != nil && apierrs.IsNotFound(err) {
-		log.Info("Creating StatefulSet", "namespace", ss.Namespace, "name", ss.Name)
-		err = r.Create(ctx, ss)
-		justCreated = true
+	// VM workspaces need the KubeVirt CRDs installed; degrade gracefully if absent.
+	if wsType == WorkspaceTypeVM {
+		installed, err := r.kubeVirtInstalled(ctx)
 		if err != nil {
-			log.Error(err, "unable to create StatefulSet")
+			log.Error(err, "unable to check KubeVirt availability")
 			return ctrl.Result{}, err
 		}
-	} else if err != nil {
-		log.Error(err, "error getting StatefulSet")
-		return ctrl.Result{}, err
+		if !installed {
+			log.Info("KubeVirt CRDs not installed; cannot run vm workspace", "name", instance.Name)
+			r.setCondition(ctx, instance, "Ready", "False", "KubeVirtNotInstalled",
+				"KubeVirt is not installed in this cluster")
+			return ctrl.Result{}, nil
+		}
 	}
 
-	// Update the StatefulSet if needed
-	if !justCreated && statefulSetNeedsUpdate(ss, foundStateful) {
-		log.Info("Updating StatefulSet", "namespace", ss.Namespace, "name", ss.Name)
-		foundStateful.Spec.Replicas = ss.Spec.Replicas
-		foundStateful.Spec.Template.Spec.Containers = ss.Spec.Template.Spec.Containers
-		err = r.Update(ctx, foundStateful)
+	// Reconcile the workload
+	var readyReplicas int32
+	var pod *corev1.Pod
+
+	switch wsType {
+	case WorkspaceTypeVM:
+		rr, p, err := r.reconcileVirtualMachine(ctx, instance)
 		if err != nil {
-			log.Error(err, "unable to update StatefulSet")
+			ReconcileTotal.WithLabelValues("error").Inc()
+			ReconcileDuration.Observe(time.Since(reconcileStart).Seconds())
 			return ctrl.Result{}, err
 		}
+		readyReplicas, pod = rr, p
+	case WorkspaceTypeScratch:
+		rr, p, err := r.reconcileDeployment(ctx, instance)
+		if err != nil {
+			ReconcileTotal.WithLabelValues("error").Inc()
+			ReconcileDuration.Observe(time.Since(reconcileStart).Seconds())
+			return ctrl.Result{}, err
+		}
+		readyReplicas, pod = rr, p
+	default:
+		rr, p, err := r.reconcileStatefulSet(ctx, instance)
+		if err != nil {
+			ReconcileTotal.WithLabelValues("error").Inc()
+			ReconcileDuration.Observe(time.Since(reconcileStart).Seconds())
+			return ctrl.Result{}, err
+		}
+		readyReplicas, pod = rr, p
 	}
 
 	// Reconcile Service
-	service := generateService(instance)
-	if err := ctrl.SetControllerReference(instance, service, r.Scheme); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	foundService := &corev1.Service{}
-	justCreated = false
-	err = r.Get(ctx, types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, foundService)
-	if err != nil && apierrs.IsNotFound(err) {
-		log.Info("Creating Service", "namespace", service.Namespace, "name", service.Name)
-		err = r.Create(ctx, service)
-		justCreated = true
-		if err != nil {
-			log.Error(err, "unable to create Service")
-			return ctrl.Result{}, err
-		}
-	} else if err != nil {
-		log.Error(err, "error getting Service")
-		return ctrl.Result{}, err
-	}
-
-	// Update the Service if needed
-	if !justCreated && serviceNeedsUpdate(service, foundService) {
-		log.Info("Updating Service", "namespace", service.Namespace, "name", service.Name)
-		foundService.Spec.Ports = service.Spec.Ports
-		foundService.Spec.Selector = service.Spec.Selector
-		err = r.Update(ctx, foundService)
-		if err != nil {
-			log.Error(err, "unable to update Service")
-			return ctrl.Result{}, err
-		}
-	}
-
-	// Get the workspace pod for status
-	foundPod := &corev1.Pod{}
-	err = r.Get(ctx, types.NamespacedName{Name: ss.Name + "-0", Namespace: ss.Namespace}, foundPod)
-	if err != nil && apierrs.IsNotFound(err) {
-		log.Info(fmt.Sprintf("No pods are currently running for workspace: %s/%s", instance.Namespace, instance.Name))
-		foundPod = &corev1.Pod{}
-	} else if err != nil {
+	if err := r.reconcileService(ctx, instance, wsType); err != nil {
+		ReconcileTotal.WithLabelValues("error").Inc()
+		ReconcileDuration.Observe(time.Since(reconcileStart).Seconds())
 		return ctrl.Result{}, err
 	}
 
 	// Update Workspace CR status
-	if err := r.updateWorkspaceStatus(ctx, instance, foundStateful, foundPod); err != nil {
+	if err := r.updateWorkspaceStatus(ctx, instance, readyReplicas, pod); err != nil {
 		ReconcileTotal.WithLabelValues("error").Inc()
 		ReconcileDuration.Observe(time.Since(reconcileStart).Seconds())
 		return ctrl.Result{}, err
@@ -186,14 +188,14 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	_, stopped := instance.Annotations[AnnotationStopped]
 	if stopped {
 		WorkspacesTotal.WithLabelValues(instance.Namespace, "stopped").Set(1)
-	} else if foundStateful.Status.ReadyReplicas > 0 {
+	} else if readyReplicas > 0 {
 		WorkspacesTotal.WithLabelValues(instance.Namespace, "running").Set(1)
 	} else {
 		WorkspacesTotal.WithLabelValues(instance.Namespace, "starting").Set(1)
 	}
 
 	// Record ready time (time from creation to first ready state)
-	if foundStateful.Status.ReadyReplicas > 0 && !instance.CreationTimestamp.IsZero() {
+	if readyReplicas > 0 && !instance.CreationTimestamp.IsZero() {
 		readyTime := time.Since(instance.CreationTimestamp.Time).Seconds()
 		// Only record if this is a reasonable startup time (< 30 min, avoids re-recording on every reconcile)
 		if readyTime < 1800 && readyTime > 0 {
@@ -217,22 +219,312 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	return ctrl.Result{}, nil
 }
 
-// updateWorkspaceStatus updates the Workspace CR status based on the StatefulSet and Pod state.
+// workspaceTypeOf returns the workspace's spec.type, defaulting to container.
+func workspaceTypeOf(ws *kubeworkspacesiov1alpha1.Workspace) string {
+	if ws.Spec.Type == "" {
+		return WorkspaceTypeContainer
+	}
+	return ws.Spec.Type
+}
+
+// kubeVirtInstalled reports whether the KubeVirt VirtualMachine CRD exists.
+func (r *WorkspaceReconciler) kubeVirtInstalled(ctx context.Context) (bool, error) {
+	vm := &unstructured.Unstructured{}
+	vm.SetGroupVersionKind(kubeVirtVirtualMachineGVK)
+	err := r.Get(ctx, types.NamespacedName{Namespace: metav1.NamespaceSystem, Name: "kubevirt-probe"}, vm)
+	if err == nil {
+		return true, nil
+	}
+	if apierrs.IsNotFound(err) {
+		// Object not found means the CRD (and API) exists — the probe object never does.
+		return true, nil
+	}
+	if isNoMatchError(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+// isNoMatchError detects "no kind is registered for the type" style errors
+// returned when a CRD's API group is not served by the cluster.
+func isNoMatchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "no matches for kind") ||
+		strings.Contains(msg, "the server could not find the requested resource") ||
+		strings.Contains(msg, "no kind is registered")
+}
+
+// setCondition writes a single status condition, replacing any of the same type.
+func (r *WorkspaceReconciler) setCondition(ctx context.Context, ws *kubeworkspacesiov1alpha1.Workspace,
+	condType, status, reason, message string) {
+
+	var conditions []kubeworkspacesiov1alpha1.WorkspaceCondition
+	for _, c := range ws.Status.Conditions {
+		if c.Type != condType {
+			conditions = append(conditions, c)
+		}
+	}
+	conditions = append(conditions, kubeworkspacesiov1alpha1.WorkspaceCondition{
+		Type:               condType,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: metav1.Now(),
+	})
+	if reflect.DeepEqual(ws.Status.Conditions, conditions) {
+		return
+	}
+	ws.Status.Conditions = conditions
+	if err := r.Status().Update(ctx, ws); err != nil {
+		logf.FromContext(ctx).Error(err, "unable to set workspace condition")
+	}
+}
+
+// reconcileStatefulSet handles container-type workspaces (today's behaviour).
+// Returns ready replicas and the workspace pod ({name}-0).
+func (r *WorkspaceReconciler) reconcileStatefulSet(ctx context.Context, instance *kubeworkspacesiov1alpha1.Workspace) (int32, *corev1.Pod, error) {
+	log := logf.FromContext(ctx)
+
+	ss := generateStatefulSet(instance)
+	if err := ctrl.SetControllerReference(instance, ss, r.Scheme); err != nil {
+		return 0, nil, err
+	}
+
+	foundStateful := &appsv1.StatefulSet{}
+	justCreated := false
+	err := r.Get(ctx, types.NamespacedName{Name: ss.Name, Namespace: ss.Namespace}, foundStateful)
+	if err != nil && apierrs.IsNotFound(err) {
+		log.Info("Creating StatefulSet", "namespace", ss.Namespace, "name", ss.Name)
+		err = r.Create(ctx, ss)
+		justCreated = true
+		if err != nil {
+			log.Error(err, "unable to create StatefulSet")
+			return 0, nil, err
+		}
+	} else if err != nil {
+		log.Error(err, "error getting StatefulSet")
+		return 0, nil, err
+	}
+
+	// Update the StatefulSet if needed
+	if !justCreated && statefulSetNeedsUpdate(ss, foundStateful) {
+		log.Info("Updating StatefulSet", "namespace", ss.Namespace, "name", ss.Name)
+		foundStateful.Spec.Replicas = ss.Spec.Replicas
+		foundStateful.Spec.Template.Spec.Containers = ss.Spec.Template.Spec.Containers
+		if err := r.Update(ctx, foundStateful); err != nil {
+			log.Error(err, "unable to update StatefulSet")
+			return 0, nil, err
+		}
+	}
+
+	pod, err := r.getPod(ctx, instance.Namespace, ss.Name+"-0")
+	if err != nil {
+		return foundStateful.Status.ReadyReplicas, nil, err
+	}
+	return foundStateful.Status.ReadyReplicas, pod, nil
+}
+
+// reconcileDeployment handles scratch-type workspaces: a plain Deployment with
+// replicas 0/1 driven by the stopped annotation. Pod names are generated, so
+// the pod is resolved via the workspace-name label.
+func (r *WorkspaceReconciler) reconcileDeployment(ctx context.Context, instance *kubeworkspacesiov1alpha1.Workspace) (int32, *corev1.Pod, error) {
+	log := logf.FromContext(ctx)
+
+	dep := generateDeployment(instance)
+	if err := ctrl.SetControllerReference(instance, dep, r.Scheme); err != nil {
+		return 0, nil, err
+	}
+
+	found := &appsv1.Deployment{}
+	justCreated := false
+	err := r.Get(ctx, types.NamespacedName{Name: dep.Name, Namespace: dep.Namespace}, found)
+	if err != nil && apierrs.IsNotFound(err) {
+		log.Info("Creating Deployment", "namespace", dep.Namespace, "name", dep.Name)
+		err = r.Create(ctx, dep)
+		justCreated = true
+		if err != nil {
+			log.Error(err, "unable to create Deployment")
+			return 0, nil, err
+		}
+	} else if err != nil {
+		log.Error(err, "error getting Deployment")
+		return 0, nil, err
+	}
+
+	if !justCreated && deploymentNeedsUpdate(dep, found) {
+		log.Info("Updating Deployment", "namespace", dep.Namespace, "name", dep.Name)
+		found.Spec.Replicas = dep.Spec.Replicas
+		found.Spec.Template.Spec.Containers = dep.Spec.Template.Spec.Containers
+		found.Spec.Template.Spec.InitContainers = dep.Spec.Template.Spec.InitContainers
+		found.Spec.Template.Spec.Volumes = dep.Spec.Template.Spec.Volumes
+		if err := r.Update(ctx, found); err != nil {
+			log.Error(err, "unable to update Deployment")
+			return 0, nil, err
+		}
+	}
+
+	pod, err := r.podByLabel(ctx, instance.Namespace, LabelWorkspaceName+"="+instance.Name)
+	if err != nil {
+		return found.Status.ReadyReplicas, nil, err
+	}
+	return found.Status.ReadyReplicas, pod, nil
+}
+
+// reconcileVirtualMachine handles vm-type workspaces: a KubeVirt VirtualMachine
+// whose root disk is a containerDisk built from the workspace's main container
+// image. Status is derived from the virt-launcher pod, which KubeVirt labels
+// with vm.kubevirt.io/name=<vm name>; we also inject the workspace-name label
+// into the VMI template so the existing pod watch maps it back to the Workspace.
+func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, instance *kubeworkspacesiov1alpha1.Workspace) (int32, *corev1.Pod, error) {
+	log := logf.FromContext(ctx)
+
+	desired := generateVirtualMachine(instance)
+	if err := ctrl.SetControllerReference(instance, desired, r.Scheme); err != nil {
+		return 0, nil, err
+	}
+
+	found := &unstructured.Unstructured{}
+	found.SetGroupVersionKind(kubeVirtVirtualMachineGVK)
+	justCreated := false
+	err := r.Get(ctx, types.NamespacedName{Name: desired.GetName(), Namespace: desired.GetNamespace()}, found)
+	if err != nil && apierrs.IsNotFound(err) {
+		log.Info("Creating VirtualMachine", "namespace", desired.GetNamespace(), "name", desired.GetName())
+		err = r.Create(ctx, desired)
+		justCreated = true
+		if err != nil {
+			log.Error(err, "unable to create VirtualMachine")
+			return 0, nil, err
+		}
+	} else if err != nil {
+		log.Error(err, "error getting VirtualMachine")
+		return 0, nil, err
+	}
+
+	if !justCreated && virtualMachineNeedsUpdate(desired, found) {
+		log.Info("Updating VirtualMachine", "namespace", desired.GetNamespace(), "name", desired.GetName())
+		found.Object["spec"] = desired.Object["spec"]
+		if err := r.Update(ctx, found); err != nil {
+			log.Error(err, "unable to update VirtualMachine")
+			return 0, nil, err
+		}
+	}
+
+	// The launcher pod only exists while the VM is running.
+	pod, err := r.podByLabel(ctx, instance.Namespace, LabelKubevirtVM+"="+instance.Name)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	var readyReplicas int32
+	if pod != nil && podReady(pod) {
+		readyReplicas = 1
+	}
+	return readyReplicas, pod, nil
+}
+
+// podReady reports whether a pod's Ready condition is True.
+func podReady(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+// getPod fetches a pod by name, returning nil (not error) when it doesn't exist.
+func (r *WorkspaceReconciler) getPod(ctx context.Context, namespace, name string) (*corev1.Pod, error) {
+	pod := &corev1.Pod{}
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, pod)
+	if err != nil {
+		if apierrs.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return pod, nil
+}
+
+// podByLabel returns the first pod matching the selector, nil if none exist.
+func (r *WorkspaceReconciler) podByLabel(ctx context.Context, namespace, selector string) (*corev1.Pod, error) {
+	sel, err := labels.Parse(selector)
+	if err != nil {
+		return nil, err
+	}
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabelsSelector{
+		Selector: sel,
+	}); err != nil {
+		return nil, err
+	}
+	if len(podList.Items) == 0 {
+		return nil, nil
+	}
+	return &podList.Items[0], nil
+}
+
+// reconcileService ensures the Service exists with the selector matching the
+// workload type. VM and scratch workloads both expose pods labelled
+// workspace-name; container workloads use the StatefulSet selector.
+func (r *WorkspaceReconciler) reconcileService(ctx context.Context, instance *kubeworkspacesiov1alpha1.Workspace, wsType string) error {
+	log := logf.FromContext(ctx)
+
+	service := generateService(instance, wsType)
+	if err := ctrl.SetControllerReference(instance, service, r.Scheme); err != nil {
+		return err
+	}
+
+	foundService := &corev1.Service{}
+	justCreated := false
+	err := r.Get(ctx, types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, foundService)
+	if err != nil && apierrs.IsNotFound(err) {
+		log.Info("Creating Service", "namespace", service.Namespace, "name", service.Name)
+		err = r.Create(ctx, service)
+		justCreated = true
+		if err != nil {
+			log.Error(err, "unable to create Service")
+			return err
+		}
+	} else if err != nil {
+		log.Error(err, "error getting Service")
+		return err
+	}
+
+	// Update the Service if needed
+	if !justCreated && serviceNeedsUpdate(service, foundService) {
+		log.Info("Updating Service", "namespace", service.Namespace, "name", service.Name)
+		foundService.Spec.Ports = service.Spec.Ports
+		foundService.Spec.Selector = service.Spec.Selector
+		if err := r.Update(ctx, foundService); err != nil {
+			log.Error(err, "unable to update Service")
+			return err
+		}
+	}
+	return nil
+}
+
+// updateWorkspaceStatus updates the Workspace CR status from the workload's
+// ready-replica count and the serving pod's state.
 func (r *WorkspaceReconciler) updateWorkspaceStatus(ctx context.Context,
-	ws *kubeworkspacesiov1alpha1.Workspace, sts *appsv1.StatefulSet, pod *corev1.Pod) error {
+	ws *kubeworkspacesiov1alpha1.Workspace, readyReplicas int32, pod *corev1.Pod) error {
 
 	log := logf.FromContext(ctx)
 
 	status := kubeworkspacesiov1alpha1.WorkspaceStatus{
 		Conditions:     make([]kubeworkspacesiov1alpha1.WorkspaceCondition, 0),
-		ReadyReplicas:  sts.Status.ReadyReplicas,
+		ReadyReplicas:  readyReplicas,
 		ContainerState: corev1.ContainerState{},
 	}
 
 	// Update the status based on the Pod's status
-	if !reflect.DeepEqual(pod.Status, corev1.PodStatus{}) {
+	if pod != nil && !reflect.DeepEqual(pod.Status, corev1.PodStatus{}) {
 		// Use the first container status (single-container workspaces)
-		// or match by the container name from the workspace spec
 		if len(pod.Status.ContainerStatuses) > 0 {
 			status.ContainerState = pod.Status.ContainerStatuses[0].State
 		}
@@ -346,10 +638,221 @@ func generateStatefulSet(instance *kubeworkspacesiov1alpha1.Workspace) *appsv1.S
 	return ss
 }
 
+// generateDeployment creates the desired Deployment for a scratch workspace.
+// Identical pod template handling to generateStatefulSet, but as a Deployment
+// with generated pod names (no persistent identity).
+func generateDeployment(instance *kubeworkspacesiov1alpha1.Workspace) *appsv1.Deployment {
+	replicas := int32(1)
+	if _, stopped := instance.Annotations[AnnotationStopped]; stopped {
+		replicas = 0
+	}
+
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      instance.Name,
+			Namespace: instance.Namespace,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"deployment": instance.Name,
+				},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"deployment":       instance.Name,
+						LabelWorkspaceName: instance.Name,
+					},
+					Annotations: map[string]string{},
+				},
+				Spec: *instance.Spec.Template.Spec.DeepCopy(),
+			},
+		},
+	}
+
+	for k, v := range instance.Labels {
+		dep.Spec.Template.Labels[k] = v
+	}
+	for k, v := range instance.Annotations {
+		if k != AnnotationStopped {
+			dep.Spec.Template.Annotations[k] = v
+		}
+	}
+
+	podSpec := &dep.Spec.Template.Spec
+	if len(podSpec.Containers) > 0 {
+		container := &podSpec.Containers[0]
+		if len(container.Ports) == 0 || container.Ports[0].ContainerPort == 0 {
+			container.Ports = []corev1.ContainerPort{
+				{
+					ContainerPort: DefaultContainerPort,
+					Name:          "workspace-port",
+					Protocol:      "TCP",
+				},
+			}
+		}
+	}
+
+	return dep
+}
+
+// generateVirtualMachine creates the desired KubeVirt VirtualMachine for a vm
+// workspace. The main container image becomes a containerDisk root volume —
+// containerDisk images are OCI images, so the same image reference works.
+// Declared container ports are forwarded via masquerade interfaces. The VMI
+// template carries the workspace-name label so the existing pod watch maps the
+// virt-launcher pod back to this Workspace.
+func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace) *unstructured.Unstructured {
+	stopped := false
+	if _, ok := instance.Annotations[AnnotationStopped]; ok {
+		stopped = true
+	}
+
+	podSpec := instance.Spec.Template.Spec
+
+	// Domain resources from the main container's requests/limits.
+	resources := map[string]interface{}{}
+	if len(podSpec.Containers) > 0 {
+		if req := podSpec.Containers[0].Resources.Requests; len(req) > 0 {
+			requests := map[string]interface{}{}
+			for k, v := range req {
+				requests[k.String()] = v.String()
+			}
+			resources["requests"] = requests
+		}
+		if lim := podSpec.Containers[0].Resources.Limits; len(lim) > 0 {
+			limits := map[string]interface{}{}
+			for k, v := range lim {
+				limits[k.String()] = v.String()
+			}
+			resources["limits"] = limits
+		}
+	}
+
+	// Masquerade interfaces forwarding every declared container port.
+	interfaces := []interface{}{}
+	networks := []interface{}{
+		map[string]interface{}{"name": "default", "pod": map[string]interface{}{}},
+	}
+	if len(podSpec.Containers) > 0 {
+		ports := podSpec.Containers[0].Ports
+		if len(ports) == 0 {
+			ports = []corev1.ContainerPort{{ContainerPort: DefaultContainerPort}}
+		}
+		ifaces := make([]interface{}, 0, len(ports))
+		for i, p := range ports {
+			name := p.Name
+			if name == "" {
+				name = fmt.Sprintf("port-%d", i)
+			}
+			ifaces = append(ifaces, map[string]interface{}{
+				"name":       name,
+				"masquerade": map[string]interface{}{},
+				"ports": []interface{}{
+					map[string]interface{}{"port": int64(p.ContainerPort), "protocol": "TCP"},
+				},
+			})
+			networks = append(networks, map[string]interface{}{
+				"name": name,
+				"pod":  map[string]interface{}{},
+			})
+		}
+		interfaces = ifaces
+	}
+
+	// Root disk from the containerDisk image.
+	image := ""
+	if len(podSpec.Containers) > 0 {
+		image = podSpec.Containers[0].Image
+	}
+	disks := []interface{}{
+		map[string]interface{}{
+			"name": "rootdisk",
+			"disk": map[string]interface{}{"bus": "virtio"},
+		},
+	}
+	volumes := []interface{}{
+		map[string]interface{}{
+			"name":          "rootdisk",
+			"containerDisk": map[string]interface{}{"image": image},
+		},
+	}
+
+	// VMI template labels: workspace-name drives the controller's pod watch;
+	// KubeVirt also adds vm.kubevirt.io/name itself.
+	labels := map[string]interface{}{
+		LabelWorkspaceName: instance.Name,
+	}
+	for k, v := range instance.Labels {
+		labels[k] = v
+	}
+
+	vm := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": kubeVirtVirtualMachineGVK.GroupVersion().String(),
+		"kind":       kubeVirtVirtualMachineGVK.Kind,
+		"metadata": map[string]interface{}{
+			"name":      instance.Name,
+			"namespace": instance.Namespace,
+		},
+		"spec": map[string]interface{}{
+			"running": !stopped,
+			"template": map[string]interface{}{
+				"metadata": map[string]interface{}{"labels": labels},
+				"spec": map[string]interface{}{
+					"domain": map[string]interface{}{
+						"resources": resources,
+						"devices": map[string]interface{}{
+							"disks":      disks,
+							"interfaces": interfaces,
+						},
+					},
+					"networks": networks,
+					"volumes":  volumes,
+				},
+			},
+		},
+	}}
+	vm.SetGroupVersionKind(kubeVirtVirtualMachineGVK)
+	return vm
+}
+
+// virtualMachineNeedsUpdate compares the running flag and the VMI template.
+func virtualMachineNeedsUpdate(desired, current *unstructured.Unstructured) bool {
+	dRunning, _, _ := unstructured.NestedBool(desired.Object, "spec", "running")
+	cRunning, _, _ := unstructured.NestedBool(current.Object, "spec", "running")
+	if dRunning != cRunning {
+		return true
+	}
+	dT, _, _ := unstructured.NestedMap(desired.Object, "spec", "template")
+	cT, _, _ := unstructured.NestedMap(current.Object, "spec", "template")
+	return !reflect.DeepEqual(dT, cT)
+}
+
+// deploymentNeedsUpdate compares replicas, containers, init containers, volumes.
+func deploymentNeedsUpdate(desired, current *appsv1.Deployment) bool {
+	if *desired.Spec.Replicas != *current.Spec.Replicas {
+		return true
+	}
+	if !reflect.DeepEqual(desired.Spec.Template.Spec.Containers, current.Spec.Template.Spec.Containers) {
+		return true
+	}
+	if !reflect.DeepEqual(desired.Spec.Template.Spec.InitContainers, current.Spec.Template.Spec.InitContainers) {
+		return true
+	}
+	if !reflect.DeepEqual(desired.Spec.Template.Spec.Volumes, current.Spec.Template.Spec.Volumes) {
+		return true
+	}
+	return false
+}
+
 // generateService creates the desired Service for a Workspace.
 // It exposes all container ports: the first port is mapped to Service port 80 (named "http"),
 // and additional ports are exposed on their own port number.
-func generateService(instance *kubeworkspacesiov1alpha1.Workspace) *corev1.Service {
+// The selector matches the workload type: StatefulSet pods for container,
+// workspace-name labelled pods for vm and scratch.
+func generateService(instance *kubeworkspacesiov1alpha1.Workspace, wsType string) *corev1.Service {
 	servicePorts := []corev1.ServicePort{}
 
 	if len(instance.Spec.Template.Spec.Containers) > 0 {
@@ -389,6 +892,11 @@ func generateService(instance *kubeworkspacesiov1alpha1.Workspace) *corev1.Servi
 		})
 	}
 
+	selector := map[string]string{"statefulset": instance.Name}
+	if wsType == WorkspaceTypeVM || wsType == WorkspaceTypeScratch {
+		selector = map[string]string{LabelWorkspaceName: instance.Name}
+	}
+
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      instance.Name,
@@ -396,7 +904,7 @@ func generateService(instance *kubeworkspacesiov1alpha1.Workspace) *corev1.Servi
 		},
 		Spec: corev1.ServiceSpec{
 			Type:     corev1.ServiceTypeClusterIP,
-			Selector: map[string]string{"statefulset": instance.Name},
+			Selector: selector,
 			Ports:    servicePorts,
 		},
 	}
@@ -452,6 +960,7 @@ func (r *WorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&kubeworkspacesiov1alpha1.Workspace{}).
 		Owns(&appsv1.StatefulSet{}).
+		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(mapPodToRequest)).
 		Named("workspace").

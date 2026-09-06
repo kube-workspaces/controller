@@ -24,6 +24,15 @@ import (
 // WorkspaceSpec defines the desired state of Workspace.
 // Modelled closely on Kubeflow Notebook spec - wraps a full PodSpec.
 type WorkspaceSpec struct {
+	// Type selects the workload used to run the workspace.
+	// "container" (default) runs the pod template as a StatefulSet.
+	// "scratch" runs it as a plain Deployment (no persistent identity).
+	// "vm" runs it as a KubeVirt VirtualMachine; the main container image must be
+	// a containerDisk image containing a bootable guest disk.
+	// +kubebuilder:validation:Enum=container;vm;scratch
+	// +kubebuilder:default=container
+	// +optional
+	Type string `json:"type,omitempty"`
 	// Template describes the pod that will be created for the workspace.
 	Template WorkspaceTemplateSpec `json:"template"`
 }

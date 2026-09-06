@@ -103,6 +103,12 @@ type ImageSpec struct {
 	// Chrome/Chromium, ML frameworks).
 	// +optional
 	DefaultSharedMemory bool `json:"defaultSharedMemory,omitempty"`
+	// WorkspaceTypes lists the workspace types this image can be used with
+	// ("container", "vm", "scratch"). When empty, the image is offered for
+	// "container" workspaces only. VM images must be containerDisk images
+	// containing a bootable guest disk.
+	// +optional
+	WorkspaceTypes []string `json:"workspaceTypes,omitempty"`
 }
 
 // ImageLink represents a named URL link for an image.

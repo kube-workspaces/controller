@@ -1689,6 +1689,15 @@ spec:
                 items:
                   type: string
                 type: array
+              workspaceTypes:
+                description: |-
+                  WorkspaceTypes lists the workspace types this image can be used with
+                  ("container", "vm", "scratch"). When empty, the image is offered for
+                  "container" workspaces only. VM images must be containerDisk images
+                  containing a bootable guest disk.
+                items:
+                  type: string
+                type: array
             required:
             - defaultPort
             - image

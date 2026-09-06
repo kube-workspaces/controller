@@ -30,7 +30,9 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -55,6 +57,11 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(kubeworkspacesiov1alpha1.AddToScheme(scheme))
+	// Register the KubeVirt VirtualMachine GVK so the controller can set owner
+	// references on unstructured VM objects without importing the KubeVirt module.
+	scheme.AddKnownTypeWithName(schema.GroupVersionKind{
+		Group: "kubevirt.io", Version: "v1", Kind: "VirtualMachine",
+	}, &unstructured.Unstructured{})
 	// +kubebuilder:scaffold:scheme
 }
 
