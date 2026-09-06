@@ -25,6 +25,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -827,17 +828,20 @@ func virtualMachineNeedsUpdate(desired, current *unstructured.Unstructured) bool
 }
 
 // deploymentNeedsUpdate compares replicas, containers, init containers, volumes.
+// Uses apimachinery's Semantic (DeepDerivative-style) comparison, which treats
+// API-server-defaulted empty maps (e.g. resources: {}) as equal to absent ones,
+// avoiding a hot update loop.
 func deploymentNeedsUpdate(desired, current *appsv1.Deployment) bool {
 	if *desired.Spec.Replicas != *current.Spec.Replicas {
 		return true
 	}
-	if !reflect.DeepEqual(desired.Spec.Template.Spec.Containers, current.Spec.Template.Spec.Containers) {
+	if !apiequality.Semantic.DeepEqual(desired.Spec.Template.Spec.Containers, current.Spec.Template.Spec.Containers) {
 		return true
 	}
-	if !reflect.DeepEqual(desired.Spec.Template.Spec.InitContainers, current.Spec.Template.Spec.InitContainers) {
+	if !apiequality.Semantic.DeepEqual(desired.Spec.Template.Spec.InitContainers, current.Spec.Template.Spec.InitContainers) {
 		return true
 	}
-	if !reflect.DeepEqual(desired.Spec.Template.Spec.Volumes, current.Spec.Template.Spec.Volumes) {
+	if !apiequality.Semantic.DeepEqual(desired.Spec.Template.Spec.Volumes, current.Spec.Template.Spec.Volumes) {
 		return true
 	}
 	return false
@@ -908,20 +912,21 @@ func generateService(instance *kubeworkspacesiov1alpha1.Workspace, wsType string
 
 // statefulSetNeedsUpdate checks if the StatefulSet needs to be updated.
 // We compare replicas, containers, init containers, volumes, and security context.
+// Uses apimachinery semantic equality to tolerate API-server-defaulted fields.
 func statefulSetNeedsUpdate(desired, current *appsv1.StatefulSet) bool {
 	if *desired.Spec.Replicas != *current.Spec.Replicas {
 		return true
 	}
-	if !reflect.DeepEqual(desired.Spec.Template.Spec.Containers, current.Spec.Template.Spec.Containers) {
+	if !apiequality.Semantic.DeepEqual(desired.Spec.Template.Spec.Containers, current.Spec.Template.Spec.Containers) {
 		return true
 	}
-	if !reflect.DeepEqual(desired.Spec.Template.Spec.InitContainers, current.Spec.Template.Spec.InitContainers) {
+	if !apiequality.Semantic.DeepEqual(desired.Spec.Template.Spec.InitContainers, current.Spec.Template.Spec.InitContainers) {
 		return true
 	}
-	if !reflect.DeepEqual(desired.Spec.Template.Spec.Volumes, current.Spec.Template.Spec.Volumes) {
+	if !apiequality.Semantic.DeepEqual(desired.Spec.Template.Spec.Volumes, current.Spec.Template.Spec.Volumes) {
 		return true
 	}
-	if !reflect.DeepEqual(desired.Spec.Template.Spec.SecurityContext, current.Spec.Template.Spec.SecurityContext) {
+	if !apiequality.Semantic.DeepEqual(desired.Spec.Template.Spec.SecurityContext, current.Spec.Template.Spec.SecurityContext) {
 		return true
 	}
 	return false
