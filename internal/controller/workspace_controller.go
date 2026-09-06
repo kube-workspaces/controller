@@ -313,7 +313,11 @@ func (r *WorkspaceReconciler) reconcileStatefulSet(ctx context.Context, instance
 	if !justCreated && statefulSetNeedsUpdate(ss, foundStateful) {
 		log.Info("Updating StatefulSet", "namespace", ss.Namespace, "name", ss.Name)
 		foundStateful.Spec.Replicas = ss.Spec.Replicas
-		foundStateful.Spec.Template.Spec.Containers = ss.Spec.Template.Spec.Containers
+		// Assign the deep-copied PodSpec wholesale. A shallow copy of only the
+		// containers slice drops volumes/initContainers added by the API (e.g.
+		// the dshm shared-memory volume), leaving volumeMounts pointing at
+		// volumes the StatefulSet no longer has.
+		foundStateful.Spec.Template.Spec = ss.Spec.Template.Spec
 		if err := r.Update(ctx, foundStateful); err != nil {
 			log.Error(err, "unable to update StatefulSet")
 			return 0, nil, err
@@ -731,7 +735,9 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace) *unstr
 		}
 	}
 
-	// Masquerade interfaces forwarding every declared container port.
+	// A single masquerade interface on the pod network, forwarding every
+	// declared container port. KubeVirt rejects multiple interfaces bound to
+	// the same pod network.
 	interfaces := []interface{}{}
 	networks := []interface{}{
 		map[string]interface{}{"name": "default", "pod": map[string]interface{}{}},
@@ -741,25 +747,15 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace) *unstr
 		if len(ports) == 0 {
 			ports = []corev1.ContainerPort{{ContainerPort: DefaultContainerPort}}
 		}
-		ifaces := make([]interface{}, 0, len(ports))
-		for i, p := range ports {
-			name := p.Name
-			if name == "" {
-				name = fmt.Sprintf("port-%d", i)
-			}
-			ifaces = append(ifaces, map[string]interface{}{
-				"name":       name,
-				"masquerade": map[string]interface{}{},
-				"ports": []interface{}{
-					map[string]interface{}{"port": int64(p.ContainerPort), "protocol": "TCP"},
-				},
-			})
-			networks = append(networks, map[string]interface{}{
-				"name": name,
-				"pod":  map[string]interface{}{},
-			})
+		fwd := make([]interface{}, 0, len(ports))
+		for _, p := range ports {
+			fwd = append(fwd, map[string]interface{}{"port": int64(p.ContainerPort), "protocol": "TCP"})
 		}
-		interfaces = ifaces
+		interfaces = append(interfaces, map[string]interface{}{
+			"name":       "default",
+			"masquerade": map[string]interface{}{},
+			"ports":      fwd,
+		})
 	}
 
 	// Root disk from the containerDisk image.

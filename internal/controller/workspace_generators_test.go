@@ -128,16 +128,18 @@ func TestGenerateVirtualMachine(t *testing.T) {
 		t.Errorf("unexpected domain requests: %v", reqs)
 	}
 
-	// Masquerade interfaces forwarding both declared ports
+	// One masquerade interface on the pod network forwarding both declared ports
 	ifaces, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "domain", "devices", "interfaces")
-	if len(ifaces) != 2 {
-		t.Fatalf("expected 2 interfaces, got %d", len(ifaces))
+	if len(ifaces) != 1 {
+		t.Fatalf("expected 1 interface, got %d", len(ifaces))
 	}
-	for _, raw := range ifaces {
-		iface := raw.(map[string]interface{})
-		if _, ok := iface["masquerade"]; !ok {
-			t.Errorf("interface %v missing masquerade", iface)
-		}
+	iface := ifaces[0].(map[string]interface{})
+	if _, ok := iface["masquerade"]; !ok {
+		t.Errorf("interface missing masquerade: %v", iface)
+	}
+	ports, _, _ := unstructured.NestedSlice(iface, "ports")
+	if len(ports) != 2 {
+		t.Errorf("expected 2 forwarded ports, got %d", len(ports))
 	}
 
 	// workspace-name label on the VMI template (drives the pod watch)
