@@ -78,6 +78,9 @@ type WorkspaceReconciler struct {
 	client.Client
 	Scheme        *runtime.Scheme
 	EventRecorder record.EventRecorder
+	// APIReader bypasses the informer cache for resources the controller does
+	// not watch (e.g. Image CRs read for cloud-init seeding).
+	APIReader client.Reader
 }
 
 // +kubebuilder:rbac:groups=kubeworkspaces.io,resources=images,verbs=get;list;watch;create
@@ -394,7 +397,7 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 	if len(instance.Spec.Template.Spec.Containers) > 0 {
 		imageRef = instance.Spec.Template.Spec.Containers[0].Image
 	}
-	img, err := imageByRef(ctx, r, instance.Namespace, imageRef)
+	img, err := imageByRef(ctx, r.APIReader, instance.Namespace, imageRef)
 	if err != nil {
 		log.Error(err, "unable to look up Image CR for cloud-init seeding")
 		return 0, nil, err
