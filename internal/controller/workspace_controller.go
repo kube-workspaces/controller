@@ -18,7 +18,6 @@ package controller
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"reflect"
 	"strings"
@@ -806,7 +805,7 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, cloudU
 		volumes = append(volumes, map[string]interface{}{
 			"name": "cloudinitdisk",
 			"cloudInitNoCloud": map[string]interface{}{
-				"userData": base64.StdEncoding.EncodeToString([]byte(cloudUserData)),
+				"userData": cloudUserData,
 			},
 		})
 	}

@@ -17,7 +17,6 @@ limitations under the License.
 package controller
 
 import (
-	"encoding/base64"
 	"strings"
 	"testing"
 
@@ -171,16 +170,8 @@ func TestGenerateVirtualMachineWithCloudInit(t *testing.T) {
 		t.Fatalf("expected 2 volumes with cloud-init, got %d", len(volumes))
 	}
 	ci := volumes[1].(map[string]interface{})["cloudInitNoCloud"].(map[string]interface{})
-	encoded, ok := ci["userData"].(string)
-	if !ok {
-		t.Fatalf("expected inline cloud-init userData, got %v", ci)
-	}
-	decoded, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		t.Fatalf("cloud-init userData is not valid base64: %v", err)
-	}
-	if string(decoded) != userData {
-		t.Errorf("cloud-init userData mismatch: %q", string(decoded))
+	if got, ok := ci["userData"].(string); !ok || got != userData {
+		t.Errorf("expected inline plaintext userData, got %v", ci)
 	}
 
 	disks, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "domain", "devices", "disks")
