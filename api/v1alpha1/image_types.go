@@ -70,6 +70,16 @@ type ImageSpec struct {
 	// DefaultUser is the default user for this image.
 	// +optional
 	DefaultUser string `json:"defaultUser,omitempty"`
+	// DefaultPassword is the default password for DefaultUser. Only set when the
+	// image has a known default password for this user; leave empty/unset when
+	// there is no known default (e.g. the guest uses no password).
+	// +optional
+	DefaultPassword string `json:"defaultPassword,omitempty"`
+	// DefaultCloudInit indicates the image has cloud-init baked in. When true,
+	// user-data (e.g. a user/password from DefaultUser/DefaultPassword) can be
+	// seeded into the guest at first boot.
+	// +optional
+	DefaultCloudInit bool `json:"defaultCloudInit,omitempty"`
 	// DefaultHomedir is the default home directory for the default user.
 	// +optional
 	DefaultHomedir string `json:"defaultHomedir,omitempty"`
