@@ -1593,6 +1593,12 @@ spec:
               defaultUser:
                 description: DefaultUser is the default user for this image.
                 type: string
+              defaultUserData:
+                description: |-
+                  DefaultUserData is reserved user-data for the guest (cloud-init). Empty by
+                  default; later used to seed first-boot configuration when DefaultCloudInit
+                  is true. Not yet consumed by the controller.
+                type: string
               description:
                 description: Description of the image.
                 type: string

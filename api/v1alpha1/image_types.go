@@ -80,6 +80,11 @@ type ImageSpec struct {
 	// seeded into the guest at first boot.
 	// +optional
 	DefaultCloudInit bool `json:"defaultCloudInit,omitempty"`
+	// DefaultUserData is reserved user-data for the guest (cloud-init). Empty by
+	// default; later used to seed first-boot configuration when DefaultCloudInit
+	// is true. Not yet consumed by the controller.
+	// +optional
+	DefaultUserData string `json:"defaultUserData,omitempty"`
 	// DefaultHomedir is the default home directory for the default user.
 	// +optional
 	DefaultHomedir string `json:"defaultHomedir,omitempty"`
