@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	// Aliased: the k8s apimachinery "runtime" is already imported below.
 	goruntime "runtime"
@@ -36,6 +37,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -51,6 +53,8 @@ import (
 var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
+	// resyncPeriod is the cache resync interval (see ctrl.Options.Cache).
+	resyncPeriod = 2 * time.Minute
 )
 
 func init() {
@@ -228,6 +232,10 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "6dfb8862.kubeworkspaces.io",
+		// Resync every 2 minutes so workspaces whose VirtualMachine (or other
+		// workload) is deleted out-of-band are recreated without requiring an
+		// event on a type this controller does not watch.
+		Cache: cache.Options{SyncPeriod: &resyncPeriod},
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly

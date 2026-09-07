@@ -780,11 +780,11 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace) *unstr
 
 	// VMI template labels: workspace-name drives the controller's pod watch;
 	// KubeVirt also adds vm.kubevirt.io/name itself.
-	labels := map[string]interface{}{
+	vmLabels := map[string]interface{}{
 		LabelWorkspaceName: instance.Name,
 	}
 	for k, v := range instance.Labels {
-		labels[k] = v
+		vmLabels[k] = v
 	}
 
 	vm := &unstructured.Unstructured{Object: map[string]interface{}{
@@ -797,7 +797,7 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace) *unstr
 		"spec": map[string]interface{}{
 			"running": !stopped,
 			"template": map[string]interface{}{
-				"metadata": map[string]interface{}{"labels": labels},
+				"metadata": map[string]interface{}{"labels": vmLabels},
 				"spec": map[string]interface{}{
 					"domain": map[string]interface{}{
 						"resources": resources,
@@ -947,23 +947,6 @@ func serviceNeedsUpdate(desired, current *corev1.Service) bool {
 // SetupWithManager sets up the controller with the Manager.
 func (r *WorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Map function to convert pod events to reconciliation requests
-	// Map VirtualMachine (and VMI) events to their owning Workspace, so a VM
-	// deleted out-of-band is recreated by the next reconcile instead of leaving
-	// the workspace permanently stuck.
-	mapVMToRequest := handler.MapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
-		for _, ref := range object.GetOwnerReferences() {
-			if ref.APIVersion == kubeworkspacesiov1alpha1.GroupVersion.String() && ref.Kind == "Workspace" {
-				return []reconcile.Request{
-					{NamespacedName: types.NamespacedName{
-						Name:      ref.Name,
-						Namespace: object.GetNamespace(),
-					}},
-				}
-			}
-		}
-		return nil
-	})
-
 	mapPodToRequest := handler.MapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
 		if nbName, ok := object.GetLabels()[LabelWorkspaceName]; ok {
 			return []reconcile.Request{
@@ -982,10 +965,6 @@ func (r *WorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(mapPodToRequest)).
-		WatchesMetadata(
-			&metav1.PartialObjectMetadata{TypeMeta: metav1.TypeMeta{APIVersion: kubeVirtVirtualMachineGVK.GroupVersion().String(), Kind: kubeVirtVirtualMachineGVK.Kind}},
-			handler.EnqueueRequestsFromMapFunc(mapVMToRequest),
-		).
 		Named("workspace").
 		Complete(r)
 }

@@ -27,10 +27,12 @@ import (
 	kubeworkspacesiov1alpha1 "github.com/kube-workspaces/controller/api/v1alpha1"
 )
 
+const testWorkspaceName = "my-ws"
+
 func testWorkspace(wsType string, annotations map[string]string) *kubeworkspacesiov1alpha1.Workspace {
 	return &kubeworkspacesiov1alpha1.Workspace{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        "my-ws",
+			Name:        testWorkspaceName,
 			Namespace:   "workspaces",
 			Annotations: annotations,
 		},
@@ -79,10 +81,10 @@ func TestGenerateDeployment(t *testing.T) {
 	if *dep.Spec.Replicas != 1 {
 		t.Errorf("expected 1 replica, got %d", *dep.Spec.Replicas)
 	}
-	if dep.Spec.Selector.MatchLabels["deployment"] != "my-ws" {
+	if dep.Spec.Selector.MatchLabels["deployment"] != testWorkspaceName {
 		t.Errorf("unexpected selector: %v", dep.Spec.Selector.MatchLabels)
 	}
-	if dep.Spec.Template.Labels[LabelWorkspaceName] != "my-ws" {
+	if dep.Spec.Template.Labels[LabelWorkspaceName] != testWorkspaceName {
 		t.Errorf("pod template missing workspace-name label: %v", dep.Spec.Template.Labels)
 	}
 
@@ -95,7 +97,7 @@ func TestGenerateDeployment(t *testing.T) {
 func TestGenerateVirtualMachine(t *testing.T) {
 	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil))
 
-	if vm.GetName() != "my-ws" || vm.GetNamespace() != "workspaces" {
+	if vm.GetName() != testWorkspaceName || vm.GetNamespace() != "workspaces" {
 		t.Errorf("unexpected VM identity: %s/%s", vm.GetNamespace(), vm.GetName())
 	}
 	if vm.GroupVersionKind() != kubeVirtVirtualMachineGVK {
@@ -144,7 +146,7 @@ func TestGenerateVirtualMachine(t *testing.T) {
 
 	// workspace-name label on the VMI template (drives the pod watch)
 	labels, _, _ := unstructured.NestedStringMap(vm.Object, "spec", "template", "metadata", "labels")
-	if labels[LabelWorkspaceName] != "my-ws" {
+	if labels[LabelWorkspaceName] != testWorkspaceName {
 		t.Errorf("VMI template missing workspace-name label: %v", labels)
 	}
 }
@@ -161,13 +163,13 @@ func TestGenerateServiceSelectors(t *testing.T) {
 	ws := testWorkspace(WorkspaceTypeContainer, nil)
 
 	containerSvc := generateService(ws, WorkspaceTypeContainer)
-	if containerSvc.Spec.Selector["statefulset"] != "my-ws" {
+	if containerSvc.Spec.Selector["statefulset"] != testWorkspaceName {
 		t.Errorf("container service should select statefulset label: %v", containerSvc.Spec.Selector)
 	}
 
 	for _, wsType := range []string{WorkspaceTypeVM, WorkspaceTypeScratch} {
 		svc := generateService(ws, wsType)
-		if svc.Spec.Selector[LabelWorkspaceName] != "my-ws" {
+		if svc.Spec.Selector[LabelWorkspaceName] != testWorkspaceName {
 			t.Errorf("%s service should select workspace-name label: %v", wsType, svc.Spec.Selector)
 		}
 		if _, ok := svc.Spec.Selector["statefulset"]; ok {
