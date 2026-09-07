@@ -85,6 +85,7 @@ type WorkspaceReconciler struct {
 // +kubebuilder:rbac:groups=kubeworkspaces.io,resources=workspaces/finalizers,verbs=update
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=events,verbs=get;list;watch;create;patch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
@@ -387,7 +388,26 @@ func (r *WorkspaceReconciler) reconcileDeployment(ctx context.Context, instance 
 func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, instance *kubeworkspacesiov1alpha1.Workspace) (int32, *corev1.Pod, error) {
 	log := logf.FromContext(ctx)
 
-	desired := generateVirtualMachine(instance)
+	// Seed cloud-init user-data from the Image CR's declared defaults (when the
+	// image opts in). The NoCloud Secret must exist before the VM references it.
+	imageRef := ""
+	if len(instance.Spec.Template.Spec.Containers) > 0 {
+		imageRef = instance.Spec.Template.Spec.Containers[0].Image
+	}
+	img, err := imageByRef(ctx, r, instance.Namespace, imageRef)
+	if err != nil {
+		log.Error(err, "unable to look up Image CR for cloud-init seeding")
+		return 0, nil, err
+	}
+	userData := cloudInitUserData(img)
+	if userData != "" {
+		if err := r.reconcileCloudInitSecret(ctx, instance, userData); err != nil {
+			log.Error(err, "unable to reconcile cloud-init Secret")
+			return 0, nil, err
+		}
+	}
+
+	desired := generateVirtualMachine(instance, userData)
 	if err := ctrl.SetControllerReference(instance, desired, r.Scheme); err != nil {
 		return 0, nil, err
 	}
@@ -395,7 +415,7 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 	found := &unstructured.Unstructured{}
 	found.SetGroupVersionKind(kubeVirtVirtualMachineGVK)
 	justCreated := false
-	err := r.Get(ctx, types.NamespacedName{Name: desired.GetName(), Namespace: desired.GetNamespace()}, found)
+	err = r.Get(ctx, types.NamespacedName{Name: desired.GetName(), Namespace: desired.GetNamespace()}, found)
 	if err != nil && apierrs.IsNotFound(err) {
 		log.Info("Creating VirtualMachine", "namespace", desired.GetNamespace(), "name", desired.GetName())
 		err = r.Create(ctx, desired)
@@ -710,7 +730,12 @@ func generateDeployment(instance *kubeworkspacesiov1alpha1.Workspace) *appsv1.De
 // Declared container ports are forwarded via masquerade interfaces. The VMI
 // template carries the workspace-name label so the existing pod watch maps the
 // virt-launcher pod back to this Workspace.
-func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace) *unstructured.Unstructured {
+//
+// When cloudUserData is non-empty, a NoCloud datasource backed by the
+// {workspace}-cloudinit Secret is attached so cloud-init configures the guest
+// at (re)boot. containerDisk roots are ephemeral, so cloud-init runs on every
+// start.
+func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, cloudUserData string) *unstructured.Unstructured {
 	stopped := false
 	if _, ok := instance.Annotations[AnnotationStopped]; ok {
 		stopped = true
@@ -777,6 +802,18 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace) *unstr
 			"containerDisk": map[string]interface{}{"image": image},
 		},
 	}
+	if cloudUserData != "" {
+		disks = append(disks, map[string]interface{}{
+			"name": "cloudinitdisk",
+			"disk": map[string]interface{}{"bus": "virtio"},
+		})
+		volumes = append(volumes, map[string]interface{}{
+			"name": "cloudinitdisk",
+			"cloudInitNoCloud": map[string]interface{}{
+				"secretRef": map[string]interface{}{"name": cloudInitSecretName(instance.Name)},
+			},
+		})
+	}
 
 	// VMI template labels: workspace-name drives the controller's pod watch;
 	// KubeVirt also adds vm.kubevirt.io/name itself.
@@ -814,6 +851,79 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace) *unstr
 	}}
 	vm.SetGroupVersionKind(kubeVirtVirtualMachineGVK)
 	return vm
+}
+
+// cloudInitSecretName returns the name of the Secret holding a VM workspace's
+// cloud-init NoCloud user-data.
+func cloudInitSecretName(workspaceName string) string {
+	return workspaceName + "-cloudinit"
+}
+
+// imageByRef finds the Image CR whose spec.image matches the given reference,
+// or nil when no image matches (in which case cloud-init seeding is skipped).
+func imageByRef(ctx context.Context, reader client.Reader, namespace, imageRef string) (*kubeworkspacesiov1alpha1.Image, error) {
+	images := &kubeworkspacesiov1alpha1.ImageList{}
+	if err := reader.List(ctx, images, client.InNamespace(namespace)); err != nil {
+		return nil, err
+	}
+	for i := range images.Items {
+		if images.Items[i].Spec.Image == imageRef {
+			return &images.Items[i], nil
+		}
+	}
+	return nil, nil
+}
+
+// cloudInitUserData derives the cloud-init user-data for a VM workspace from
+// the image's declared defaults. Explicit DefaultUserData wins; otherwise, when
+// the image opts in via DefaultCloudInit and provides a user/password, a
+// minimal cloud-config is generated that sets the password on the account (the
+// containerDisk root is ephemeral, so this applies on every boot). Empty
+// user-data means no datasource is attached.
+func cloudInitUserData(image *kubeworkspacesiov1alpha1.Image) string {
+	if image == nil {
+		return ""
+	}
+	if image.Spec.DefaultUserData != "" {
+		return image.Spec.DefaultUserData
+	}
+	if image.Spec.DefaultCloudInit && image.Spec.DefaultUser != "" && image.Spec.DefaultPassword != "" {
+		return fmt.Sprintf("#cloud-config\n"+
+			"disable_root: false\n"+
+			"ssh_pwauth: true\n"+
+			"chpasswd:\n"+
+			"  expire: false\n"+
+			"  list:\n"+
+			"  - %s:%s\n",
+			image.Spec.DefaultUser, image.Spec.DefaultPassword)
+	}
+	return ""
+}
+
+// reconcileCloudInitSecret ensures the Secret backing a VM workspace's NoCloud
+// datasource exists and contains the current user-data.
+func (r *WorkspaceReconciler) reconcileCloudInitSecret(ctx context.Context, instance *kubeworkspacesiov1alpha1.Workspace, userData string) error {
+	name := cloudInitSecretName(instance.Name)
+	found := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: instance.Namespace}, found)
+	switch {
+	case err == nil:
+		if string(found.Data["userdata"]) == userData {
+			return nil
+		}
+		found.Data = map[string][]byte{"userdata": []byte(userData)}
+		return r.Update(ctx, found)
+	case !apierrs.IsNotFound(err):
+		return err
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: instance.Namespace},
+		Data:       map[string][]byte{"userdata": []byte(userData)},
+	}
+	if err := ctrl.SetControllerReference(instance, secret, r.Scheme); err != nil {
+		return err
+	}
+	return r.Create(ctx, secret)
 }
 
 // virtualMachineNeedsUpdate compares the running flag and the VMI template.

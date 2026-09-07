@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -95,7 +96,7 @@ func TestGenerateDeployment(t *testing.T) {
 }
 
 func TestGenerateVirtualMachine(t *testing.T) {
-	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil))
+	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), "")
 
 	if vm.GetName() != testWorkspaceName || vm.GetNamespace() != "workspaces" {
 		t.Errorf("unexpected VM identity: %s/%s", vm.GetNamespace(), vm.GetName())
@@ -152,10 +153,78 @@ func TestGenerateVirtualMachine(t *testing.T) {
 }
 
 func TestGenerateVirtualMachineStopped(t *testing.T) {
-	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, map[string]string{AnnotationStopped: "true"}))
+	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, map[string]string{AnnotationStopped: "true"}), "")
 	running, _, _ := unstructured.NestedBool(vm.Object, "spec", "running")
 	if running {
 		t.Error("expected spec.running=false for a stopped workspace")
+	}
+}
+
+func TestGenerateVirtualMachineWithCloudInit(t *testing.T) {
+	ws := testWorkspace(WorkspaceTypeVM, nil)
+	vm := generateVirtualMachine(ws, "#cloud-config\npassword: secret\n")
+
+	volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
+	if len(volumes) != 2 {
+		t.Fatalf("expected 2 volumes with cloud-init, got %d", len(volumes))
+	}
+	ci := volumes[1].(map[string]interface{})["cloudInitNoCloud"].(map[string]interface{})
+	ref := ci["secretRef"].(map[string]interface{})
+	if ref["name"] != cloudInitSecretName(ws.Name) {
+		t.Errorf("unexpected cloud-init secret name: %v", ref["name"])
+	}
+
+	disks, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "domain", "devices", "disks")
+	if len(disks) != 2 {
+		t.Fatalf("expected 2 disks with cloud-init, got %d", len(disks))
+	}
+	if disks[1].(map[string]interface{})["name"] != "cloudinitdisk" {
+		t.Errorf("unexpected second disk: %v", disks[1])
+	}
+}
+
+func TestGenerateVirtualMachineNoCloudInit(t *testing.T) {
+	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), "")
+	volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
+	if len(volumes) != 1 {
+		t.Fatalf("expected 1 volume without cloud-init, got %d", len(volumes))
+	}
+}
+
+func TestCloudInitUserData(t *testing.T) {
+	nilImage := cloudInitUserData(nil)
+	if nilImage != "" {
+		t.Errorf("expected empty user-data for nil image, got %q", nilImage)
+	}
+
+	image := &kubeworkspacesiov1alpha1.Image{
+		Spec: kubeworkspacesiov1alpha1.ImageSpec{
+			Image: "quay.io/containerdisks/debian:12",
+		},
+	}
+	if ud := cloudInitUserData(image); ud != "" {
+		t.Errorf("expected empty user-data without cloud-init opt-in, got %q", ud)
+	}
+
+	image.Spec.DefaultCloudInit = true
+	image.Spec.DefaultUser = "root"
+	image.Spec.DefaultPassword = "debian"
+	if ud := cloudInitUserData(image); ud == "" {
+		t.Error("expected generated user-data when cloud-init defaults are set")
+	} else if !strings.Contains(ud, "- root:debian") {
+		t.Errorf("expected root:debian password in generated user-data, got %q", ud)
+	}
+
+	image.Spec.DefaultUserData = "#cloud-config\ncustom: true\n"
+	if ud := cloudInitUserData(image); ud != "#cloud-config\ncustom: true\n" {
+		t.Errorf("explicit DefaultUserData should win, got %q", ud)
+	}
+
+	partial := &kubeworkspacesiov1alpha1.Image{}
+	partial.Spec.DefaultCloudInit = true
+	partial.Spec.DefaultUser = "root"
+	if ud := cloudInitUserData(partial); ud != "" {
+		t.Errorf("expected empty user-data when password is missing, got %q", ud)
 	}
 }
 
