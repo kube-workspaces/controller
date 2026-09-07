@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 
@@ -162,16 +163,24 @@ func TestGenerateVirtualMachineStopped(t *testing.T) {
 
 func TestGenerateVirtualMachineWithCloudInit(t *testing.T) {
 	ws := testWorkspace(WorkspaceTypeVM, nil)
-	vm := generateVirtualMachine(ws, "#cloud-config\npassword: secret\n")
+	const userData = "#cloud-config\npassword: secret\n"
+	vm := generateVirtualMachine(ws, userData)
 
 	volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
 	if len(volumes) != 2 {
 		t.Fatalf("expected 2 volumes with cloud-init, got %d", len(volumes))
 	}
 	ci := volumes[1].(map[string]interface{})["cloudInitNoCloud"].(map[string]interface{})
-	ref := ci["secretRef"].(map[string]interface{})
-	if ref["name"] != cloudInitSecretName(ws.Name) {
-		t.Errorf("unexpected cloud-init secret name: %v", ref["name"])
+	encoded, ok := ci["userData"].(string)
+	if !ok {
+		t.Fatalf("expected inline cloud-init userData, got %v", ci)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("cloud-init userData is not valid base64: %v", err)
+	}
+	if string(decoded) != userData {
+		t.Errorf("cloud-init userData mismatch: %q", string(decoded))
 	}
 
 	disks, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "domain", "devices", "disks")

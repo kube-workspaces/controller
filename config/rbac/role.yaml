@@ -19,7 +19,6 @@ rules:
   resources:
   - namespaces
   - resourcequotas
-  - secrets
   - services
   verbs:
   - create
