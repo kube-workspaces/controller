@@ -220,7 +220,7 @@ func TestCloudInitUserData(t *testing.T) {
 	image.Spec.DefaultPassword = "debian"
 	if ud := cloudInitUserData(image); ud == "" {
 		t.Error("expected generated user-data when cloud-init defaults are set")
-	} else if !strings.Contains(ud, "- root:debian") {
+	} else if !strings.Contains(ud, "list: |\n    root:debian") {
 		t.Errorf("expected root:debian password in generated user-data, got %q", ud)
 	}
 

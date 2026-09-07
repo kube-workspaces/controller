@@ -879,12 +879,11 @@ func cloudInitUserData(image *kubeworkspacesiov1alpha1.Image) string {
 	}
 	if image.Spec.DefaultCloudInit && image.Spec.DefaultUser != "" && image.Spec.DefaultPassword != "" {
 		return fmt.Sprintf("#cloud-config\n"+
-			"disable_root: false\n"+
 			"ssh_pwauth: true\n"+
 			"chpasswd:\n"+
 			"  expire: false\n"+
-			"  list:\n"+
-			"  - %s:%s\n",
+			"  list: |\n"+
+			"    %s:%s\n",
 			image.Spec.DefaultUser, image.Spec.DefaultPassword)
 	}
 	return ""
