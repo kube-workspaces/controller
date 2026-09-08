@@ -51,6 +51,10 @@ const (
 	DefaultServingPort = 80
 	// AnnotationStopped is the annotation that indicates a workspace is stopped
 	AnnotationStopped = "kubeworkspaces.io/stopped"
+	// AnnotationReset is the annotation that requests a reset (re-provisioning
+	// the workspace from its image, giving it a fresh root volume). The API
+	// stamps it with a timestamp so every reset is unique.
+	AnnotationReset = "kubeworkspaces.io/reset"
 	// LabelWorkspaceName is the label applied to pods to identify the workspace
 	LabelWorkspaceName = "workspace-name"
 	// LabelKubevirtVM is set by KubeVirt on virt-launcher pods, naming the VMI
@@ -138,6 +142,20 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			r.setCondition(ctx, instance, "Ready", "False", "KubeVirtNotInstalled",
 				"KubeVirt is not installed in this cluster")
 			return ctrl.Result{}, nil
+		}
+
+		// A reset request re-provisions the VM back to pristine: delete the
+		// VirtualMachine so the owned root DataVolume/PVC is garbage collected,
+		// then recreate it fresh from the image on a later reconcile. Handled
+		// here (before the workload switch) so the reset path can requeue.
+		res, resetHandled, err := r.handleReset(ctx, instance)
+		if err != nil {
+			ReconcileTotal.WithLabelValues("error").Inc()
+			ReconcileDuration.Observe(time.Since(reconcileStart).Seconds())
+			return ctrl.Result{}, err
+		}
+		if resetHandled {
+			return res, nil
 		}
 	}
 
@@ -447,6 +465,60 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 		readyReplicas = 1
 	}
 	return readyReplicas, pod, nil
+}
+
+// handleReset re-provisions a vm workspace when a reset has been requested.
+// The API stamps the kubeworkspaces.io/reset annotation; handling it here
+// deletes the VirtualMachine, whose owned DataVolume/PVC (the persistent root
+// volume) is garbage collected along with it. The annotation is only cleared
+// once the VirtualMachine is fully gone so the next reconcile recreates the
+// workspace from its image with a fresh root disk. It returns (Result, true)
+// for every reset path so the caller skips the normal workload reconcile.
+func (r *WorkspaceReconciler) handleReset(ctx context.Context, instance *kubeworkspacesiov1alpha1.Workspace) (ctrl.Result, bool, error) {
+	if _, ok := instance.Annotations[AnnotationReset]; !ok {
+		return ctrl.Result{}, false, nil
+	}
+	log := logf.FromContext(ctx)
+	log.Info("Reset requested; re-provisioning VirtualMachine from image", "namespace", instance.Namespace, "name", instance.Name)
+
+	found := &unstructured.Unstructured{}
+	found.SetGroupVersionKind(kubeVirtVirtualMachineGVK)
+	err := r.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, found)
+	if err == nil {
+		if found.GetDeletionTimestamp().IsZero() {
+			log.Info("Deleting VirtualMachine", "namespace", found.GetNamespace(), "name", found.GetName())
+			// Foreground propagation so the owned root DataVolume/PVC is
+			// garbage collected before the VM disappears, guaranteeing a clean
+			// re-import of a fresh root volume.
+			if err := r.Delete(ctx, found, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil && !apierrs.IsNotFound(err) {
+				log.Error(err, "unable to delete VirtualMachine for reset")
+				return ctrl.Result{}, true, err
+			}
+		}
+		// The VM still exists (or is mid-deletion): keep the reset annotation
+		// and requeue until it and its root volume are gone.
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, true, nil
+	}
+	if !apierrs.IsNotFound(err) {
+		log.Error(err, "unable to get VirtualMachine for reset")
+		return ctrl.Result{}, true, err
+	}
+
+	// The VirtualMachine (and its root volume) are gone; consume the reset
+	// annotation so the next reconcile recreates the workspace fresh.
+	log.Info("VirtualMachine deleted; clearing reset annotation", "namespace", instance.Namespace, "name", instance.Name)
+	annotations := instance.GetAnnotations()
+	delete(annotations, AnnotationReset)
+	// A fresh re-provision is a fresh workspace: restart the ready-time clock.
+	delete(annotations, "kubeworkspaces.io/ready-time-recorded")
+	instance.SetAnnotations(annotations)
+	if err := r.Update(ctx, instance); err != nil {
+		log.Error(err, "unable to clear reset annotation")
+		return ctrl.Result{}, true, err
+	}
+	// Give the old root volume's garbage collection a beat before the next
+	// reconcile imports a new DataVolume under the same name.
+	return ctrl.Result{RequeueAfter: 3 * time.Second}, true, nil
 }
 
 // podReady reports whether a pod's Ready condition is True.
