@@ -76,6 +76,14 @@ var kubeVirtVirtualMachineGVK = schema.GroupVersionKind{
 	Kind:    "VirtualMachine",
 }
 
+// kubeVirtVirtualMachineInstanceGVK identifies KubeVirt VirtualMachineInstance
+// objects without importing the KubeVirt API module.
+var kubeVirtVirtualMachineInstanceGVK = schema.GroupVersionKind{
+	Group:   "kubevirt.io",
+	Version: "v1",
+	Kind:    "VirtualMachineInstance",
+}
+
 // WorkspaceReconciler reconciles a Workspace object
 type WorkspaceReconciler struct {
 	client.Client
@@ -460,8 +468,14 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 		return 0, nil, err
 	}
 
+	// The VMI must exist and be in Running phase for the workspace to be
+	// considered ready. Without this, a crashed/restarting VMI still reports
+	// readyReplicas=1 because the virt-launcher pod stays in Ready state while
+	// the guest is down.
+	vmiReady := vmiIsRunning(ctx, r.Client, instance)
+
 	var readyReplicas int32
-	if pod != nil && podReady(pod) {
+	if pod != nil && podReady(pod) && vmiReady {
 		readyReplicas = 1
 	}
 	return readyReplicas, pod, nil
@@ -519,6 +533,19 @@ func (r *WorkspaceReconciler) handleReset(ctx context.Context, instance *kubewor
 	// Give the old root volume's garbage collection a beat before the next
 	// reconcile imports a new DataVolume under the same name.
 	return ctrl.Result{RequeueAfter: 3 * time.Second}, true, nil
+}
+
+// vmiIsRunning reports whether the VirtualMachineInstance backing this
+// workspace exists and is in the Running phase. A missing or non-Running VMI
+// means the VM is stopped, crashing, or restarting.
+func vmiIsRunning(ctx context.Context, reader client.Reader, ws *kubeworkspacesiov1alpha1.Workspace) bool {
+	vmi := &unstructured.Unstructured{}
+	vmi.SetGroupVersionKind(kubeVirtVirtualMachineInstanceGVK)
+	if err := reader.Get(ctx, types.NamespacedName{Name: ws.Name, Namespace: ws.Namespace}, vmi); err != nil {
+		return false
+	}
+	phase, _, _ := unstructured.NestedString(vmi.Object, "status", "phase")
+	return phase == "Running"
 }
 
 // podReady reports whether a pod's Ready condition is True.
@@ -970,13 +997,20 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 	}
 	// When MemoryRequest decouples the pod allocation from the guest RAM, pin
 	// the domain memory explicitly so KubeVirt does not re-derive the guest from
-	// the inflated pod request.
-	if img != nil && img.Spec.MemoryLimit != "" && img.Spec.MemoryRequest != "" {
-		domain, _, _ := unstructured.NestedMap(vmSpec, "template", "spec", "domain")
-		if domain != nil {
+	// the inflated pod request. Also pin the domain CPU cores from the container
+	// resource limits — without domain.cpu.cores KubeVirt ignores the CPU limit
+	// and defaults to 1 vCPU.
+	domain, _, _ := unstructured.NestedMap(vmSpec, "template", "spec", "domain")
+	if domain != nil {
+		if img != nil && img.Spec.MemoryLimit != "" && img.Spec.MemoryRequest != "" {
 			domain["memory"] = map[string]interface{}{"guest": img.Spec.MemoryLimit}
-			_ = unstructured.SetNestedField(vmSpec["template"].(map[string]interface{})["spec"].(map[string]interface{}), domain, "domain")
 		}
+		if limits, ok, _ := unstructured.NestedMap(resources, "limits"); ok {
+			if cpu, hasCPU := limits["cpu"].(string); hasCPU && cpu != "" {
+				domain["cpu"] = map[string]interface{}{"cores": cpu}
+			}
+		}
+		_ = unstructured.SetNestedField(vmSpec["template"].(map[string]interface{})["spec"].(map[string]interface{}), domain, "domain")
 	}
 	if len(dataVolumeTemplates) > 0 {
 		vmSpec["dataVolumeTemplates"] = dataVolumeTemplates
