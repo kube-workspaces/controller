@@ -94,6 +94,7 @@ type WorkspaceReconciler struct {
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstances,verbs=get;list;watch
 // +kubebuilder:rbac:groups=subresources.kubevirt.io,resources=virtualmachineinstances/console,verbs=get
+// +kubebuilder:rbac:groups=subresources.kubevirt.io,resources=virtualmachineinstances/vnc,verbs=get
 
 // Reconcile is the main reconciliation loop for Workspace resources.
 // It ensures the workload matching the workspace type (StatefulSet, Deployment

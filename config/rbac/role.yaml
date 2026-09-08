@@ -127,6 +127,7 @@ rules:
   - subresources.kubevirt.io
   resources:
   - virtualmachineinstances/console
+  - virtualmachineinstances/vnc
   verbs:
   - get
 ---
