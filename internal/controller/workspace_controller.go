@@ -952,8 +952,15 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 				"domain": map[string]interface{}{
 					"resources": resources,
 					"devices": map[string]interface{}{
-						"disks":      disks,
-						"interfaces": interfaces,
+						"disks":                    disks,
+						"interfaces":               interfaces,
+						"autoattachGraphicsDevice": false,
+						"gpus": []interface{}{
+							map[string]interface{}{
+								"name": "virtio-gpu-0",
+								"type": "virtio",
+							},
+						},
 					},
 				},
 				"networks": networks,
