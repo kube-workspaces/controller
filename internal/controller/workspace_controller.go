@@ -26,6 +26,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/resource"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -1006,8 +1007,15 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 			domain["memory"] = map[string]interface{}{"guest": img.Spec.MemoryLimit}
 		}
 		if limits, ok, _ := unstructured.NestedMap(resources, "limits"); ok {
-			if cpu, hasCPU := limits["cpu"].(string); hasCPU && cpu != "" {
-				domain["cpu"] = map[string]interface{}{"cores": cpu}
+			if cpuStr, hasCPU := limits["cpu"].(string); hasCPU && cpuStr != "" {
+				q, err := resource.ParseQuantity(cpuStr)
+				if err == nil {
+					cores := q.Value()
+					if cores < 1 {
+						cores = 1
+					}
+					domain["cpu"] = map[string]interface{}{"cores": cores}
+				}
 			}
 		}
 		_ = unstructured.SetNestedField(vmSpec["template"].(map[string]interface{})["spec"].(map[string]interface{}), domain, "domain")
