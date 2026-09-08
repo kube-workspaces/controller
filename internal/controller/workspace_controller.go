@@ -758,22 +758,27 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 			resources["limits"] = limits
 		}
 	}
-	// Desktop images may need more memory than the container defaults; the
-	// Image CR can override only the domain limit. A virtualized desktop
-	// requests the full limit so QoS guarantees it is not evicted; otherwise
-	// memory-hungry guests can be killed under load.
+	// Desktop images may need more memory than the container defaults. The Image
+	// CR can raise the guest RAM via MemoryLimit (kept equal to the pod request
+	// so QoS keeps the workload Guaranteed) and optionally decouple the pod
+	// allocation with MemoryRequest so the virt-launcher pod is granted headroom
+	// above the guest RAM for qemu overhead, without inflating guest memory.
 	if img != nil && img.Spec.MemoryLimit != "" {
 		limits, _, _ := unstructured.NestedMap(resources, "limits")
 		if limits == nil {
 			limits = map[string]interface{}{}
 		}
-		limits["memory"] = img.Spec.MemoryLimit
-		resources["limits"] = limits
 		reqMap, _, _ := unstructured.NestedMap(resources, "requests")
 		if reqMap == nil {
 			reqMap = map[string]interface{}{}
 		}
-		reqMap["memory"] = img.Spec.MemoryLimit
+		podMem := img.Spec.MemoryLimit
+		if img.Spec.MemoryRequest != "" {
+			podMem = img.Spec.MemoryRequest
+		}
+		limits["memory"] = podMem
+		resources["limits"] = limits
+		reqMap["memory"] = podMem
 		resources["requests"] = reqMap
 	}
 
@@ -883,6 +888,16 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 				"volumes":  volumes,
 			},
 		},
+	}
+	// When MemoryRequest decouples the pod allocation from the guest RAM, pin
+	// the domain memory explicitly so KubeVirt does not re-derive the guest from
+	// the inflated pod request.
+	if img != nil && img.Spec.MemoryLimit != "" && img.Spec.MemoryRequest != "" {
+		domain, _, _ := unstructured.NestedMap(vmSpec, "template", "spec", "domain")
+		if domain != nil {
+			domain["memory"] = map[string]interface{}{"guest": img.Spec.MemoryLimit}
+			_ = unstructured.SetNestedField(vmSpec["template"].(map[string]interface{})["spec"].(map[string]interface{}), domain, "domain")
+		}
 	}
 	if len(dataVolumeTemplates) > 0 {
 		vmSpec["dataVolumeTemplates"] = dataVolumeTemplates

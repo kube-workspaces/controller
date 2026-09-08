@@ -134,11 +134,22 @@ type ImageSpec struct {
 	// PersistentRootDisk is true (e.g. "10Gi"). Defaults to "10Gi" when empty.
 	// +optional
 	PersistentRootDiskSize string `json:"persistentRootDiskSize,omitempty"`
-	// MemoryLimit overrides the VM domain memory for vm workspaces (e.g. "4Gi").
-	// Useful for desktop images that need more memory than the container-default
-	// memory requests/limits. Empty means use the container's resources as-is.
+	// MemoryLimit overrides the VM domain memory (guest RAM) for vm workspaces
+	// (e.g. "4Gi"). Useful for desktop images that need more memory than the
+	// container-default memory requests/limits. Empty means use the container's
+	// resources as-is.
 	// +optional
 	MemoryLimit string `json:"memoryLimit,omitempty"`
+	// MemoryRequest overrides the virt-launcher pod memory request and limit for
+	// vm workspaces (e.g. "5Gi"). Use together with MemoryLimit to decouple the
+	// pod allocation from the guest RAM: the guest gets MemoryLimit while the pod
+	// is granted extra headroom for qemu overhead (TCG translation buffers, page
+	// cache, virt-launcher), preventing OOM-kills when limits would otherwise sit
+	// at exactly MemoryLimit plus KubeVirt's minimal overhead. Requires
+	// MemoryRequest >= MemoryLimit. Empty keeps the pod request/limit equal to
+	// MemoryLimit (or the container defaults when MemoryLimit is empty).
+	// +optional
+	MemoryRequest string `json:"memoryRequest,omitempty"`
 }
 
 // ImageLink represents a named URL link for an image.

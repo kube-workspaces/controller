@@ -281,6 +281,34 @@ func TestGenerateVirtualMachineMemoryOverrideWithoutPersistentRoot(t *testing.T)
 	}
 }
 
+func TestGenerateVirtualMachineMemoryRequestDecouplesPodFromGuest(t *testing.T) {
+	ws := testWorkspace(WorkspaceTypeVM, nil)
+	img := &kubeworkspacesiov1alpha1.Image{
+		Spec: kubeworkspacesiov1alpha1.ImageSpec{
+			Image:              "quay.io/containerdisks/debian:13",
+			PersistentRootDisk: true,
+			MemoryLimit:        "4Gi",
+			MemoryRequest:      "5Gi",
+		},
+	}
+	vm := generateVirtualMachine(ws, img)
+
+	// Pod allocation (both request and limit) reflects MemoryRequest...
+	limits, _, _ := unstructured.NestedStringMap(vm.Object, "spec", "template", "spec", "domain", "resources", "limits")
+	if limits["memory"] != "5Gi" {
+		t.Errorf("expected pod memory limit 5Gi, got %v", limits)
+	}
+	reqs, _, _ := unstructured.NestedStringMap(vm.Object, "spec", "template", "spec", "domain", "resources", "requests")
+	if reqs["memory"] != "5Gi" {
+		t.Errorf("expected pod memory request 5Gi, got %v", reqs)
+	}
+	// ...while the guest RAM stays pinned to MemoryLimit.
+	guest, _, _ := unstructured.NestedString(vm.Object, "spec", "template", "spec", "domain", "memory", "guest")
+	if guest != "4Gi" {
+		t.Errorf("expected guest memory 4Gi, got %q", guest)
+	}
+}
+
 func TestCloudInitUserData(t *testing.T) {
 	nilImage := cloudInitUserData(nil)
 	if nilImage != "" {
