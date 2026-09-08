@@ -124,6 +124,21 @@ type ImageSpec struct {
 	// containing a bootable guest disk.
 	// +optional
 	WorkspaceTypes []string `json:"workspaceTypes,omitempty"`
+	// PersistentRootDisk indicates the VM root disk should be a DataVolume
+	// backing-persistent PVC imported from the container disk image (via CDI)
+	// rather than an ephemeral containerDisk. Requires a storage class that CDI
+	// can provision. Ignored for non-vm workspaces.
+	// +optional
+	PersistentRootDisk bool `json:"persistentRootDisk,omitempty"`
+	// PersistentRootDiskSize is the requested root PVC size when
+	// PersistentRootDisk is true (e.g. "10Gi"). Defaults to "10Gi" when empty.
+	// +optional
+	PersistentRootDiskSize string `json:"persistentRootDiskSize,omitempty"`
+	// MemoryLimit overrides the VM domain memory for vm workspaces (e.g. "4Gi").
+	// Useful for desktop images that need more memory than the container-default
+	// memory requests/limits. Empty means use the container's resources as-is.
+	// +optional
+	MemoryLimit string `json:"memoryLimit,omitempty"`
 }
 
 // ImageLink represents a named URL link for an image.

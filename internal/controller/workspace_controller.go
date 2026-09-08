@@ -393,6 +393,8 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 
 	// Seed cloud-init user-data from the Image CR's declared defaults (when the
 	// image opts in). The user-data is inlined in the VM's NoCloud datasource.
+	// The Image CR also drives the persistent root-disk (DataVolume) and memory
+	// overrides for desktop images.
 	imageRef := ""
 	if len(instance.Spec.Template.Spec.Containers) > 0 {
 		imageRef = instance.Spec.Template.Spec.Containers[0].Image
@@ -402,9 +404,8 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 		log.Error(err, "unable to look up Image CR for cloud-init seeding")
 		return 0, nil, err
 	}
-	userData := cloudInitUserData(img)
 
-	desired := generateVirtualMachine(instance, userData)
+	desired := generateVirtualMachine(instance, img)
 	if err := ctrl.SetControllerReference(instance, desired, r.Scheme); err != nil {
 		return 0, nil, err
 	}
@@ -731,7 +732,7 @@ func generateDeployment(instance *kubeworkspacesiov1alpha1.Workspace) *appsv1.De
 // When cloudUserData is non-empty, a NoCloud datasource with the user-data
 // inlined is attached so cloud-init configures the guest at (re)boot.
 // containerDisk roots are ephemeral, so cloud-init runs on every start.
-func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, cloudUserData string) *unstructured.Unstructured {
+func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *kubeworkspacesiov1alpha1.Image) *unstructured.Unstructured {
 	stopped := false
 	if _, ok := instance.Annotations[AnnotationStopped]; ok {
 		stopped = true
@@ -755,6 +756,28 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, cloudU
 				limits[k.String()] = v.String()
 			}
 			resources["limits"] = limits
+		}
+	}
+	// Desktop images may need more memory than the container defaults; the
+	// Image CR can override only the domain limit (the rest still counts toward
+	// the pod's actual memory for scheduling purposes).
+	if img != nil && img.Spec.MemoryLimit != "" {
+		limits, _, _ := unstructured.NestedMap(resources, "limits")
+		if limits == nil {
+			limits = map[string]interface{}{}
+		}
+		limits["memory"] = img.Spec.MemoryLimit
+		resources["limits"] = limits
+	}
+	// A virtualized desktop requests the full limit so QoS guarantees it is
+	// not evicted; otherwise memory-hungry guests can be killed under load.
+	if resources["requests"] == nil {
+		resources["requests"] = map[string]interface{}{}
+	}
+	requests, _, _ := unstructured.NestedMap(resources, "requests")
+	if lim, ok := resources["limits"].(map[string]interface{}); ok {
+		if mem, ok := lim["memory"]; ok {
+			requests["memory"] = mem
 		}
 	}
 
@@ -781,23 +804,51 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, cloudU
 		})
 	}
 
-	// Root disk from the containerDisk image.
+	// Root disk: an ephemeral containerDisk by default; a registry-imported
+	// DataVolume (persistent PVC) when the image opts in via PersistentRootDisk.
 	image := ""
 	if len(podSpec.Containers) > 0 {
 		image = podSpec.Containers[0].Image
 	}
+	persistentRoot := img != nil && img.Spec.PersistentRootDisk && image != ""
+	var dataVolumeTemplates []interface{}
 	disks := []interface{}{
 		map[string]interface{}{
 			"name": "rootdisk",
 			"disk": map[string]interface{}{"bus": "virtio"},
 		},
 	}
-	volumes := []interface{}{
-		map[string]interface{}{
+	volumes := []interface{}{}
+	if persistentRoot {
+		size := img.Spec.PersistentRootDiskSize
+		if size == "" {
+			size = "10Gi"
+		}
+		dataVolumeTemplates = append(dataVolumeTemplates, map[string]interface{}{
+			"metadata": map[string]interface{}{"name": "rootdisk"},
+			"spec": map[string]interface{}{
+				"source": map[string]interface{}{
+					"registry": map[string]interface{}{"url": "docker://" + image},
+				},
+				"pvc": map[string]interface{}{
+					"accessModes": []interface{}{"ReadWriteOnce"},
+					"resources": map[string]interface{}{
+						"requests": map[string]interface{}{"storage": size},
+					},
+				},
+			},
+		})
+		volumes = append(volumes, map[string]interface{}{
+			"name":       "rootdisk",
+			"dataVolume": map[string]interface{}{"name": "rootdisk"},
+		})
+	} else {
+		volumes = append(volumes, map[string]interface{}{
 			"name":          "rootdisk",
 			"containerDisk": map[string]interface{}{"image": image},
-		},
+		})
 	}
+	cloudUserData := cloudInitUserData(img)
 	if cloudUserData != "" {
 		disks = append(disks, map[string]interface{}{
 			"name": "cloudinitdisk",
@@ -820,6 +871,27 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, cloudU
 		vmLabels[k] = v
 	}
 
+	vmSpec := map[string]interface{}{
+		"running": !stopped,
+		"template": map[string]interface{}{
+			"metadata": map[string]interface{}{"labels": vmLabels},
+			"spec": map[string]interface{}{
+				"domain": map[string]interface{}{
+					"resources": resources,
+					"devices": map[string]interface{}{
+						"disks":      disks,
+						"interfaces": interfaces,
+					},
+				},
+				"networks": networks,
+				"volumes":  volumes,
+			},
+		},
+	}
+	if len(dataVolumeTemplates) > 0 {
+		vmSpec["dataVolumeTemplates"] = dataVolumeTemplates
+	}
+
 	vm := &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": kubeVirtVirtualMachineGVK.GroupVersion().String(),
 		"kind":       kubeVirtVirtualMachineGVK.Kind,
@@ -827,23 +899,7 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, cloudU
 			"name":      instance.Name,
 			"namespace": instance.Namespace,
 		},
-		"spec": map[string]interface{}{
-			"running": !stopped,
-			"template": map[string]interface{}{
-				"metadata": map[string]interface{}{"labels": vmLabels},
-				"spec": map[string]interface{}{
-					"domain": map[string]interface{}{
-						"resources": resources,
-						"devices": map[string]interface{}{
-							"disks":      disks,
-							"interfaces": interfaces,
-						},
-					},
-					"networks": networks,
-					"volumes":  volumes,
-				},
-			},
-		},
+		"spec": vmSpec,
 	}}
 	vm.SetGroupVersionKind(kubeVirtVirtualMachineGVK)
 	return vm
