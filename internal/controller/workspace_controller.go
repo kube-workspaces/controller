@@ -982,6 +982,13 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 					"devices": map[string]interface{}{
 						"disks":      disks,
 						"interfaces": interfaces,
+						"inputs": []interface{}{
+							map[string]interface{}{
+								"type": "tablet",
+								"bus":  "usb",
+								"name": "tablet",
+							},
+						},
 					},
 				},
 				"networks": networks,
