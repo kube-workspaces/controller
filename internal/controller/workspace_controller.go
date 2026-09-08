@@ -759,8 +759,9 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 		}
 	}
 	// Desktop images may need more memory than the container defaults; the
-	// Image CR can override only the domain limit (the rest still counts toward
-	// the pod's actual memory for scheduling purposes).
+	// Image CR can override only the domain limit. A virtualized desktop
+	// requests the full limit so QoS guarantees it is not evicted; otherwise
+	// memory-hungry guests can be killed under load.
 	if img != nil && img.Spec.MemoryLimit != "" {
 		limits, _, _ := unstructured.NestedMap(resources, "limits")
 		if limits == nil {
@@ -768,17 +769,12 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 		}
 		limits["memory"] = img.Spec.MemoryLimit
 		resources["limits"] = limits
-	}
-	// A virtualized desktop requests the full limit so QoS guarantees it is
-	// not evicted; otherwise memory-hungry guests can be killed under load.
-	if resources["requests"] == nil {
-		resources["requests"] = map[string]interface{}{}
-	}
-	requests, _, _ := unstructured.NestedMap(resources, "requests")
-	if lim, ok := resources["limits"].(map[string]interface{}); ok {
-		if mem, ok := lim["memory"]; ok {
-			requests["memory"] = mem
+		reqMap, _, _ := unstructured.NestedMap(resources, "requests")
+		if reqMap == nil {
+			reqMap = map[string]interface{}{}
 		}
+		reqMap["memory"] = img.Spec.MemoryLimit
+		resources["requests"] = reqMap
 	}
 
 	// A single masquerade interface on the pod network, forwarding every

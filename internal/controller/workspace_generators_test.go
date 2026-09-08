@@ -96,7 +96,7 @@ func TestGenerateDeployment(t *testing.T) {
 }
 
 func TestGenerateVirtualMachine(t *testing.T) {
-	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), "")
+	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), nil)
 
 	if vm.GetName() != testWorkspaceName || vm.GetNamespace() != "workspaces" {
 		t.Errorf("unexpected VM identity: %s/%s", vm.GetNamespace(), vm.GetName())
@@ -153,7 +153,7 @@ func TestGenerateVirtualMachine(t *testing.T) {
 }
 
 func TestGenerateVirtualMachineStopped(t *testing.T) {
-	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, map[string]string{AnnotationStopped: "true"}), "")
+	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, map[string]string{AnnotationStopped: "true"}), nil)
 	running, _, _ := unstructured.NestedBool(vm.Object, "spec", "running")
 	if running {
 		t.Error("expected spec.running=false for a stopped workspace")
@@ -163,7 +163,13 @@ func TestGenerateVirtualMachineStopped(t *testing.T) {
 func TestGenerateVirtualMachineWithCloudInit(t *testing.T) {
 	ws := testWorkspace(WorkspaceTypeVM, nil)
 	const userData = "#cloud-config\npassword: secret\n"
-	vm := generateVirtualMachine(ws, userData)
+	img := &kubeworkspacesiov1alpha1.Image{
+		Spec: kubeworkspacesiov1alpha1.ImageSpec{
+			Image:           "quay.io/containerdisks/fedora:latest",
+			DefaultUserData: userData,
+		},
+	}
+	vm := generateVirtualMachine(ws, img)
 
 	volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
 	if len(volumes) != 2 {
@@ -184,10 +190,94 @@ func TestGenerateVirtualMachineWithCloudInit(t *testing.T) {
 }
 
 func TestGenerateVirtualMachineNoCloudInit(t *testing.T) {
-	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), "")
+	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), nil)
 	volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
 	if len(volumes) != 1 {
 		t.Fatalf("expected 1 volume without cloud-init, got %d", len(volumes))
+	}
+}
+
+func TestGenerateVirtualMachinePersistentRootDisk(t *testing.T) {
+	ws := testWorkspace(WorkspaceTypeVM, nil)
+	img := &kubeworkspacesiov1alpha1.Image{
+		Spec: kubeworkspacesiov1alpha1.ImageSpec{
+			Image:                  "quay.io/containerdisks/debian:12",
+			PersistentRootDisk:     true,
+			PersistentRootDiskSize: "20Gi",
+			MemoryLimit:            "4Gi",
+			DefaultUserData:        "#cloud-config\npackages: [task-gnome-desktop]\n",
+		},
+	}
+	vm := generateVirtualMachine(ws, img)
+
+	// No containerDisk; root is a dataVolume referencing the template.
+	volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
+	if len(volumes) != 2 {
+		t.Fatalf("expected 2 volumes (root dataVolume + cloud-init), got %d", len(volumes))
+	}
+	root := volumes[0].(map[string]interface{})
+	if _, ok := root["containerDisk"]; ok {
+		t.Error("root disk must not be a containerDisk when persistentRootDisk is set")
+	}
+	dv, ok := root["dataVolume"].(map[string]interface{})
+	if !ok || dv["name"] != "rootdisk" {
+		t.Errorf("root volume should reference the rootdisk DataVolume, got %v", root)
+	}
+
+	// dataVolumeTemplates carries the registry import and PVC sizing.
+	templates, _, _ := unstructured.NestedSlice(vm.Object, "spec", "dataVolumeTemplates")
+	if len(templates) != 1 {
+		t.Fatalf("expected 1 dataVolumeTemplate, got %d", len(templates))
+	}
+	tmpl := templates[0].(map[string]interface{})
+	if tmpl["metadata"].(map[string]interface{})["name"] != "rootdisk" {
+		t.Fatalf("unexpected dataVolumeTemplate metadata: %v", tmpl["metadata"])
+	}
+	url, _, _ := unstructured.NestedString(tmpl, "spec", "source", "registry", "url")
+	if url != "docker://quay.io/containerdisks/fedora:latest" {
+		t.Errorf("unexpected registry source URL: %q", url)
+	}
+	size, _, _ := unstructured.NestedString(tmpl, "spec", "pvc", "resources", "requests", "storage")
+	if size != "20Gi" {
+		t.Errorf("unexpected PVC size: %q", size)
+	}
+
+	// Memory override is applied to both limits and requests (QoS).
+	limits, _, _ := unstructured.NestedStringMap(vm.Object, "spec", "template", "spec", "domain", "resources", "limits")
+	if limits["memory"] != "4Gi" {
+		t.Errorf("expected memory limit 4Gi, got %v", limits)
+	}
+	reqs, _, _ := unstructured.NestedStringMap(vm.Object, "spec", "template", "spec", "domain", "resources", "requests")
+	if reqs["memory"] != "4Gi" {
+		t.Errorf("expected memory request 4Gi, got %v", reqs)
+	}
+}
+
+func TestGenerateVirtualMachineMemoryOverrideWithoutPersistentRoot(t *testing.T) {
+	ws := testWorkspace(WorkspaceTypeVM, nil)
+	img := &kubeworkspacesiov1alpha1.Image{
+		Spec: kubeworkspacesiov1alpha1.ImageSpec{
+			Image:       "quay.io/containerdisks/fedora:latest",
+			MemoryLimit: "2Gi",
+		},
+	}
+	vm := generateVirtualMachine(ws, img)
+
+	volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
+	root := volumes[0].(map[string]interface{})
+	if _, ok := root["containerDisk"]; !ok {
+		t.Error("root disk should remain a containerDisk when persistentRootDisk is unset")
+	}
+	if _, found, _ := unstructured.NestedSlice(vm.Object, "spec", "dataVolumeTemplates"); found {
+		t.Error("no dataVolumeTemplates expected without persistentRootDisk")
+	}
+	limits, _, _ := unstructured.NestedStringMap(vm.Object, "spec", "template", "spec", "domain", "resources", "limits")
+	if limits["memory"] != "2Gi" {
+		t.Errorf("expected memory limit 2Gi, got %v", limits)
+	}
+	reqs, _, _ := unstructured.NestedStringMap(vm.Object, "spec", "template", "spec", "domain", "resources", "requests")
+	if reqs["memory"] != "2Gi" {
+		t.Errorf("expected memory request 2Gi, got %v", reqs)
 	}
 }
 
