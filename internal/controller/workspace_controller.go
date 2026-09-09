@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 
@@ -863,6 +864,49 @@ func macAddressForWorkspace(name string) string {
 	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5])
 }
 
+// gpuDevicesFromLimits builds the KubeVirt `domain.devices.gpus[]` list from a
+// container's resource limits. Any resource whose name KubeVirt recognises as a
+// GPU (a vendor GPU resource like nvidia.com/gpu / amd.com/gpu / intel.com/gpu,
+// or any resource key ending in "/gpu") is emitted as a passthrough GPU device
+// with deviceName == the resource name. The matching resource limit must also be
+// present in domain.resources.limits (which generateVirtualMachine already
+// copies verbatim from the container), so KubeVirt has both the scheduling
+// resource and the VFIO attach declaration it needs. Output is sorted by
+// resource name so the gpus[] slice is stable across reconciles (the workspace
+// update-detection uses reflect.DeepEqual, and slice order matters).
+func gpuDevicesFromLimits(limits corev1.ResourceList) []interface{} {
+	gpuResources := make([]string, 0, len(limits))
+	for name := range limits {
+		if !isGPUResource(name.String()) {
+			continue
+		}
+		gpuResources = append(gpuResources, name.String())
+	}
+	sort.Strings(gpuResources)
+
+	gpus := make([]interface{}, 0, len(gpuResources))
+	for idx, name := range gpuResources {
+		gpus = append(gpus, map[string]interface{}{
+			"deviceName": name,
+			"name":       fmt.Sprintf("gpu%d", idx),
+		})
+	}
+	return gpus
+}
+
+// isGPUResource reports whether a resource name designates a GPU that KubeVirt
+// can pass through. We match the well-known vendor GPU resources plus any
+// resource whose name ends in "/gpu" (the common convention for GPU device
+// plugin resource names).
+func isGPUResource(name string) bool {
+	switch name {
+	case "nvidia.com/gpu", "amd.com/gpu", "intel.com/gpu":
+		return true
+	}
+	_, vendor, ok := strings.Cut(name, "/")
+	return ok && vendor == "gpu"
+}
+
 // containerDisk roots are ephemeral, so cloud-init runs on every start.
 func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *kubeworkspacesiov1alpha1.Image, sshKeys []string) *unstructured.Unstructured {
 	stopped := false
@@ -912,6 +956,15 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 		resources["limits"] = limits
 		reqMap["memory"] = podMem
 		resources["requests"] = reqMap
+	}
+
+	// GPU passthrough: derive the KubeVirt gpus[] declaration from the main
+	// container's GPU resource limits. The same limits are already copied into
+	// domain.resources.limits above, giving KubeVirt both halves it needs
+	// (scheduling resource + VFIO device attach).
+	var gpus []interface{}
+	if len(podSpec.Containers) > 0 {
+		gpus = gpuDevicesFromLimits(podSpec.Containers[0].Resources.Limits)
 	}
 
 	// A single masquerade interface on the pod network, forwarding every
@@ -1019,6 +1072,7 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 					"devices": map[string]interface{}{
 						"disks":      disks,
 						"interfaces": interfaces,
+						"gpus":       gpus,
 						"inputs": []interface{}{
 							map[string]interface{}{
 								"type": "tablet",
@@ -1032,6 +1086,30 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 				"volumes":  volumes,
 			},
 		},
+	}
+	// Carry the workspace's scheduling constraints (nodeSelector, tolerations —
+	// including the auto-added GPU toleration) into the VMI template so the
+	// virt-launcher pod can land on dedicated/tainted GPU nodes.
+	if len(podSpec.Tolerations) > 0 {
+		tols := make([]interface{}, 0, len(podSpec.Tolerations))
+		for _, t := range podSpec.Tolerations {
+			tol := map[string]interface{}{
+				"key":      t.Key,
+				"operator": string(t.Operator),
+				"effect":   string(t.Effect),
+			}
+			if t.Value != "" {
+				tol["value"] = t.Value
+			}
+			if t.TolerationSeconds != nil {
+				tol["tolerationSeconds"] = *t.TolerationSeconds
+			}
+			tols = append(tols, tol)
+		}
+		_ = unstructured.SetNestedSlice(vmSpec, tols, "template", "spec", "tolerations")
+	}
+	if len(podSpec.NodeSelector) > 0 {
+		_ = unstructured.SetNestedStringMap(vmSpec, podSpec.NodeSelector, "template", "spec", "nodeSelector")
 	}
 	// When MemoryRequest decouples the pod allocation from the guest RAM, pin
 	// the domain memory explicitly so KubeVirt does not re-derive the guest from

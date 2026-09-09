@@ -32,6 +32,8 @@ import (
 
 const testWorkspaceName = "my-ws"
 
+const testNvidiaGPUResource = "nvidia.com/gpu"
+
 func testWorkspace(wsType string, annotations map[string]string) *kubeworkspacesiov1alpha1.Workspace {
 	return &kubeworkspacesiov1alpha1.Workspace{
 		ObjectMeta: metav1.ObjectMeta{
@@ -196,6 +198,100 @@ func TestGenerateVirtualMachineNoCloudInit(t *testing.T) {
 	volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
 	if len(volumes) != 1 {
 		t.Fatalf("expected 1 volume without cloud-init, got %d", len(volumes))
+	}
+}
+
+// testWorkspaceWithGPU returns a VM workspace whose main container requests
+// the given GPU resource name; count defaults to "1". The resource limit is
+// added so the controller can discover it when building the domain gpus[].
+func testWorkspaceWithGPU(wsType, gpuResource string) *kubeworkspacesiov1alpha1.Workspace {
+	ws := testWorkspace(wsType, nil)
+	ws.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceName(gpuResource)] = resource.MustParse("1")
+	return ws
+}
+
+func TestGenerateVirtualMachineGPU(t *testing.T) {
+	ws := testWorkspaceWithGPU(WorkspaceTypeVM, testNvidiaGPUResource)
+	vm := generateVirtualMachine(ws, nil, nil)
+
+	// The GPU resource must appear in domain.resources.limits (already copied
+	// from the container) so KubeVirt has the scheduling resource.
+	limits, _, _ := unstructured.NestedStringMap(vm.Object, "spec", "template", "spec", "domain", "resources", "limits")
+	if limits[testNvidiaGPUResource] != "1" {
+		t.Errorf("expected nvidia.com/gpu limit 1 in domain resources, got %v", limits)
+	}
+
+	// And it must be declared as a passthrough device under domain.devices.gpus.
+	gpus, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "domain", "devices", "gpus")
+	if len(gpus) != 1 {
+		t.Fatalf("expected 1 gpu device, got %d", len(gpus))
+	}
+	gpu := gpus[0].(map[string]interface{})
+	if gpu["deviceName"] != testNvidiaGPUResource {
+		t.Errorf("unexpected gpu deviceName: %v", gpu["deviceName"])
+	}
+	if gpu["name"] != "gpu0" {
+		t.Errorf("expected gpu slot name gpu0, got %v", gpu["name"])
+	}
+}
+
+func TestGenerateVirtualMachineNoGPU(t *testing.T) {
+	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), nil, nil)
+	gpus, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "domain", "devices", "gpus")
+	if len(gpus) != 0 {
+		t.Errorf("expected no gpus without a GPU request, got %d", len(gpus))
+	}
+}
+
+func TestGenerateVirtualMachineScheduling(t *testing.T) {
+	ws := testWorkspace(WorkspaceTypeVM, nil)
+	ws.Spec.Template.Spec.NodeSelector = map[string]string{"nvidia.com/gpu.present": "true"}
+	ws.Spec.Template.Spec.Tolerations = []corev1.Toleration{
+		{Key: testNvidiaGPUResource, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
+	}
+	vm := generateVirtualMachine(ws, nil, nil)
+
+	ns, _, _ := unstructured.NestedStringMap(vm.Object, "spec", "template", "spec", "nodeSelector")
+	if ns["nvidia.com/gpu.present"] != "true" {
+		t.Errorf("expected nodeSelector to be carried into the VMI template, got %v", ns)
+	}
+
+	tols, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "tolerations")
+	if len(tols) != 1 {
+		t.Fatalf("expected 1 toleration in the VMI template, got %d", len(tols))
+	}
+	tol := tols[0].(map[string]interface{})
+	if tol["key"] != testNvidiaGPUResource || tol["effect"] != "NoSchedule" {
+		t.Errorf("unexpected toleration in the VMI template: %v", tol)
+	}
+}
+
+func TestGpuDevicesFromLimits(t *testing.T) {
+	cases := []struct {
+		name     string
+		limits   corev1.ResourceList
+		expected []string // deviceName order
+	}{
+		{"nvidia known resource", corev1.ResourceList{testNvidiaGPUResource: resource.MustParse("2")}, []string{testNvidiaGPUResource}},
+		{"amd known resource", corev1.ResourceList{"amd.com/gpu": resource.MustParse("1")}, []string{"amd.com/gpu"}},
+		{"custom /gpu suffix", corev1.ResourceList{"example.com/gpu": resource.MustParse("1")}, []string{"example.com/gpu"}},
+		{"non-gpu ignored", corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}, nil},
+		{"gpu plus cpu", corev1.ResourceList{testNvidiaGPUResource: resource.MustParse("1"), corev1.ResourceCPU: resource.MustParse("2")}, []string{testNvidiaGPUResource}},
+		{"multiple gpus sorted", corev1.ResourceList{"intel.com/gpu": resource.MustParse("1"), "amd.com/gpu": resource.MustParse("2"), testNvidiaGPUResource: resource.MustParse("1")}, []string{"amd.com/gpu", "intel.com/gpu", testNvidiaGPUResource}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := gpuDevicesFromLimits(tc.limits)
+			if len(got) != len(tc.expected) {
+				t.Fatalf("expected %d gpus, got %d", len(tc.expected), len(got))
+			}
+			for i, g := range got {
+				m := g.(map[string]interface{})
+				if m["deviceName"] != tc.expected[i] {
+					t.Errorf("device %d: expected deviceName %q, got %v", i, tc.expected[i], m["deviceName"])
+				}
+			}
+		})
 	}
 }
 
