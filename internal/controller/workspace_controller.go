@@ -18,7 +18,9 @@ package controller
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"hash/fnv"
 	"reflect"
 	"strings"
 	"time"
@@ -844,6 +846,23 @@ func generateDeployment(instance *kubeworkspacesiov1alpha1.Workspace) *appsv1.De
 //
 // When cloudUserData is non-empty, a NoCloud datasource with the user-data
 // inlined is attached so cloud-init configures the guest at (re)boot.
+func macAddressForWorkspace(name string) string {
+	h := fnv.New64a()
+	h.Write([]byte(name))
+	v := h.Sum64()
+	b := make([]byte, 6)
+	// First octet carries the locally-administered (bit 1) unicast (bit 0)
+	// flags so the MAC is safe to use on any network without colliding with
+	// vendor-assigned hardware addresses.
+	b[0] = byte(v>>40)&0xFE | 0x02
+	b[1] = byte(v >> 32)
+	b[2] = byte(v >> 24)
+	b[3] = byte(v >> 16)
+	b[4] = byte(v >> 8)
+	b[5] = byte(v)
+	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5])
+}
+
 // containerDisk roots are ephemeral, so cloud-init runs on every start.
 func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *kubeworkspacesiov1alpha1.Image, sshKeys []string) *unstructured.Unstructured {
 	stopped := false
@@ -915,6 +934,11 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 			"name":       "default",
 			"masquerade": map[string]interface{}{},
 			"ports":      fwd,
+			// Pin a deterministic MAC derived from the workspace name so the
+			// guest NIC address survives VMI recreation (KubeVirt otherwise
+			// rolls a fresh random MAC on every start, which can strand DHCP
+			// bindings, DNS leases and time-based networking configs).
+			"macAddress": macAddressForWorkspace(instance.Name),
 		})
 	}
 
@@ -1089,24 +1113,27 @@ func sshAuthorizedKeysForWorkspace(ctx context.Context, reader client.Reader, na
 // minimal cloud-config is generated that sets the password on the account (the
 // containerDisk root is ephemeral, so this applies on every boot). The
 // workspace owner's SSH public keys are merged into the resulting user-data as
-// cloud-init ssh_authorized_keys so the guest's sshd trusts them. Empty
-// user-data means no datasource is attached.
+// cloud-init ssh_authorized_keys so the guest's sshd trusts them, and a
+// runcmd (PER_ALWAYS) entry re-asserts the same keys on every boot so reboots
+// never drop them. Empty user-data means no datasource is attached.
 func cloudInitUserData(image *kubeworkspacesiov1alpha1.Image, sshKeys []string) string {
 	userData := ""
-	if image == nil {
-		userData = ""
-	} else if image.Spec.DefaultUserData != "" {
-		userData = image.Spec.DefaultUserData
-	} else if image.Spec.DefaultCloudInit && image.Spec.DefaultUser != "" && image.Spec.DefaultPassword != "" {
-		userData = fmt.Sprintf("#cloud-config\n"+
-			"ssh_pwauth: true\n"+
-			"chpasswd:\n"+
-			"  expire: false\n"+
-			"  list: |\n"+
-			"    %s:%s\n",
-			image.Spec.DefaultUser, image.Spec.DefaultPassword)
+	defaultUser := ""
+	if image != nil {
+		defaultUser = image.Spec.DefaultUser
+		if image.Spec.DefaultUserData != "" {
+			userData = image.Spec.DefaultUserData
+		} else if image.Spec.DefaultCloudInit && image.Spec.DefaultUser != "" && image.Spec.DefaultPassword != "" {
+			userData = fmt.Sprintf("#cloud-config\n"+
+				"ssh_pwauth: true\n"+
+				"chpasswd:\n"+
+				"  expire: false\n"+
+				"  list: |\n"+
+				"    %s:%s\n",
+				image.Spec.DefaultUser, image.Spec.DefaultPassword)
+		}
 	}
-	return injectSSHAuthorizedKeys(userData, sshKeys)
+	return injectSSHAuthorizedKeys(userData, sshKeys, defaultUser)
 }
 
 // injectSSHAuthorizedKeys merges SSH public keys into a cloud-init user-data
@@ -1114,7 +1141,13 @@ func cloudInitUserData(image *kubeworkspacesiov1alpha1.Image, sshKeys []string) 
 // cloud-config content. Keys are appended to existing ssh_authorized_keys
 // lists; entries already present are deduplicated. When userData is empty and
 // there are keys, a minimal cloud-config carrying only the keys is emitted.
-func injectSSHAuthorizedKeys(userData string, sshKeys []string) string {
+//
+// ssh_authorized_keys is a PER_INSTANCE module: a VMI restart keeps the NoCloud
+// instance-id, so the keys would never be re-applied after the guest's first
+// boot. When defaultUser is non-empty, a runcmd entry (PER_ALWAYS) is also
+// added that idempotently appends each key to that account's authorized_keys
+// file on every boot, making key seeding reboot-safe.
+func injectSSHAuthorizedKeys(userData string, sshKeys []string, defaultUser string) string {
 	if len(sshKeys) == 0 {
 		return userData
 	}
@@ -1149,11 +1182,51 @@ func injectSSHAuthorizedKeys(userData string, sshKeys []string) string {
 		return userData
 	}
 	body["ssh_authorized_keys"] = merged
+
+	if defaultUser != "" {
+		keyList := make([]string, 0, len(merged))
+		for _, k := range merged {
+			if ks, ok := k.(string); ok {
+				keyList = append(keyList, ks)
+			}
+		}
+		if rcmd := runCmdSeeding(defaultUser, keyList); rcmd != "" {
+			existingRun, _ := body["runcmd"].([]interface{})
+			dup := false
+			for _, e := range existingRun {
+				if s, ok := e.(string); ok && s == rcmd {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				body["runcmd"] = append(existingRun, rcmd)
+			}
+		}
+	}
+
 	mergedYAML, err := yaml.Marshal(body)
 	if err != nil {
 		return userData
 	}
 	return "#cloud-config\n" + string(mergedYAML)
+}
+
+// runCmdSeeding builds the PER_ALWAYS cloud-init runcmd shell command that
+// idempotently appends every key to the given account's authorized_keys file.
+// Keys travel base64-encoded so shell special characters in key comments
+// cannot break the command. Returns "" when there is nothing to seed.
+func runCmdSeeding(user string, sshKeys []string) string {
+	if len(user) == 0 || len(sshKeys) == 0 {
+		return ""
+	}
+	sshDir := "/home/" + user + "/.ssh"
+	if user == "root" {
+		sshDir = "/root/.ssh"
+	}
+	blob := base64.StdEncoding.EncodeToString([]byte(strings.Join(sshKeys, "\n")))
+	return fmt.Sprintf("mkdir -p %s && chmod 700 %s && touch %s/authorized_keys && chmod 600 %s/authorized_keys && echo %s | base64 -d | while IFS= read -r line; do grep -qxF \"$line\" %s/authorized_keys || echo \"$line\" >> %s/authorized_keys; done",
+		sshDir, sshDir, sshDir, sshDir, blob, sshDir, sshDir)
 }
 
 // virtualMachineNeedsUpdate compares the running flag and the VMI template.

@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"encoding/base64"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -350,51 +352,95 @@ func TestInjectSSHAuthorizedKeys(t *testing.T) {
 	const k1 = "ssh-ed25519 AAAAZm9vYmFy user1@host"
 	const k2 = "ssh-rsa AAAAcmNkc2E= user2@host"
 
-	if ud := injectSSHAuthorizedKeys("", nil); ud != "" {
+	if ud := injectSSHAuthorizedKeys("", nil, ""); ud != "" {
 		t.Errorf("no keys => unchanged, got %q", ud)
 	}
-	if ud := injectSSHAuthorizedKeys("#cloud-config\ncustom: true\n", nil); ud != "#cloud-config\ncustom: true\n" {
+	if ud := injectSSHAuthorizedKeys("#cloud-config\ncustom: true\n", nil, ""); ud != "#cloud-config\ncustom: true\n" {
 		t.Errorf("no keys => unchanged existing data, got %q", ud)
 	}
 
 	// Keys only, no existing data: emit a minimal cloud-config.
-	ud := injectSSHAuthorizedKeys("", []string{k1})
+	ud := injectSSHAuthorizedKeys("", []string{k1}, "")
 	if !strings.Contains(ud, "#cloud-config") || !strings.Contains(ud, "ssh_authorized_keys") || !strings.Contains(ud, k1) {
 		t.Errorf("expected minimal cloud-config with key, got %q", ud)
 	}
+	if strings.Contains(ud, "runcmd") {
+		t.Errorf("no default user => no runcmd re-seeding, got %q", ud)
+	}
 
-	// Merge into existing generated user-data (password config preserved).
+	// Merge into existing generated user-data (password config preserved) and
+	// emit a reboot-safe runcmd entry carrying base64-encoded keys.
 	image := &kubeworkspacesiov1alpha1.Image{}
 	image.Spec.DefaultCloudInit = true
 	image.Spec.DefaultUser = "debian"
 	image.Spec.DefaultPassword = "secret"
 	full := cloudInitUserData(image, []string{k1, k2})
-	for _, want := range []string{"#cloud-config", "debian:secret", "ssh_authorized_keys", k1, k2} {
+	wantBlob := base64.StdEncoding.EncodeToString([]byte(k1 + "\n" + k2))
+	for _, want := range []string{"#cloud-config", "debian:secret", "ssh_authorized_keys", k1, k2, "runcmd", wantBlob, "/home/debian/.ssh/authorized_keys"} {
 		if !strings.Contains(full, want) {
 			t.Errorf("expected user-data to contain %q, got %q", want, full)
 		}
 	}
+	if strings.Count(full, wantBlob) != 1 {
+		t.Errorf("expected a single runcmd entry, got %q", full)
+	}
+
+	// Seed for the root account targets /root/.ssh.
+	root := injectSSHAuthorizedKeys("", []string{k1}, "root")
+	if !strings.Contains(root, "/root/.ssh/authorized_keys") {
+		t.Errorf("expected root account key seeding, got %q", root)
+	}
 
 	// Merge into explicit DefaultUserData (the baked debian-gnome case).
 	baked := "#cloud-config\nssh_pwauth: true\npackages:\n  - htop\n"
-	merged := injectSSHAuthorizedKeys(baked, []string{k1, k1})
+	merged := injectSSHAuthorizedKeys(baked, []string{k1, k1}, "debian")
 	if !strings.Contains(merged, "ssh_authorized_keys") || !strings.Contains(merged, k1) {
 		t.Errorf("expected keys merged into baked user-data, got %q", merged)
+	}
+	if !strings.Contains(merged, "runcmd") || !strings.Contains(merged, "/home/debian/.ssh/authorized_keys") {
+		t.Errorf("expected runcmd re-seeding in baked user-data, got %q", merged)
 	}
 	if !strings.Contains(merged, "htop") {
 		t.Errorf("expected packages list preserved in merged user-data, got %q", merged)
 	}
 
+	// Re-injecting the same key set is a no-op (runcmd and keys deduplicated).
+	again := injectSSHAuthorizedKeys(merged, []string{k1}, "debian")
+	if again != merged {
+		t.Errorf("expected idempotent re-injection, got %q", again)
+	}
+
 	// Dedupe: k1 twice yields one entry.
-	dedup := injectSSHAuthorizedKeys("", []string{k1, k1})
+	dedup := injectSSHAuthorizedKeys("", []string{k1, k1}, "")
 	if strings.Count(dedup, k1) != 1 {
 		t.Errorf("expected deduplicated keys, got %q", dedup)
 	}
 
 	// Invalid existing YAML is left alone rather than corrupted.
-	broken := injectSSHAuthorizedKeys("#cloud-config\n: :\n  -", []string{k1})
+	broken := injectSSHAuthorizedKeys("#cloud-config\n: :\n  -", []string{k1}, "debian")
 	if !strings.Contains(broken, ": :") {
 		t.Errorf("expected invalid user-data left as-is, got %q", broken)
+	}
+}
+
+func TestMacAddressForWorkspace(t *testing.T) {
+	a := macAddressForWorkspace("cf-debian-gnome-vm-0")
+	b := macAddressForWorkspace("cf-debian-gnome-vm-0")
+	if a != b {
+		t.Errorf("expected deterministic MAC for a workspace, got %q vs %q", a, b)
+	}
+	other := macAddressForWorkspace("cf-debian-vm-0")
+	if a == other {
+		t.Errorf("expected distinct MACs for different workspaces, got %q", a)
+	}
+	octet, err := strconv.ParseUint(a[:2], 16, 8)
+	if err != nil || octet&0x01 != 0 || octet&0x02 != 0x02 {
+		t.Errorf("expected locally-administered unicast MAC (first octet 0x02..0xfe even), got %q", a)
+	}
+	for _, wantColonCount := range []int{5} {
+		if got := strings.Count(a, ":"); got != wantColonCount {
+			t.Errorf("expected MAC with 5 colons, got %q (%d)", a, got)
+		}
 	}
 }
 
