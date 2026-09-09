@@ -96,7 +96,7 @@ func TestGenerateDeployment(t *testing.T) {
 }
 
 func TestGenerateVirtualMachine(t *testing.T) {
-	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), nil)
+	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), nil, nil)
 
 	if vm.GetName() != testWorkspaceName || vm.GetNamespace() != "workspaces" {
 		t.Errorf("unexpected VM identity: %s/%s", vm.GetNamespace(), vm.GetName())
@@ -153,7 +153,7 @@ func TestGenerateVirtualMachine(t *testing.T) {
 }
 
 func TestGenerateVirtualMachineStopped(t *testing.T) {
-	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, map[string]string{AnnotationStopped: "true"}), nil)
+	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, map[string]string{AnnotationStopped: "true"}), nil, nil)
 	running, _, _ := unstructured.NestedBool(vm.Object, "spec", "running")
 	if running {
 		t.Error("expected spec.running=false for a stopped workspace")
@@ -169,7 +169,7 @@ func TestGenerateVirtualMachineWithCloudInit(t *testing.T) {
 			DefaultUserData: userData,
 		},
 	}
-	vm := generateVirtualMachine(ws, img)
+	vm := generateVirtualMachine(ws, img, nil)
 
 	volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
 	if len(volumes) != 2 {
@@ -190,7 +190,7 @@ func TestGenerateVirtualMachineWithCloudInit(t *testing.T) {
 }
 
 func TestGenerateVirtualMachineNoCloudInit(t *testing.T) {
-	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), nil)
+	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), nil, nil)
 	volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
 	if len(volumes) != 1 {
 		t.Fatalf("expected 1 volume without cloud-init, got %d", len(volumes))
@@ -208,7 +208,7 @@ func TestGenerateVirtualMachinePersistentRootDisk(t *testing.T) {
 			DefaultUserData:        "#cloud-config\npackages: [task-gnome-desktop]\n",
 		},
 	}
-	vm := generateVirtualMachine(ws, img)
+	vm := generateVirtualMachine(ws, img, nil)
 
 	// No containerDisk; root is a dataVolume referencing the template.
 	volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
@@ -261,7 +261,7 @@ func TestGenerateVirtualMachineMemoryOverrideWithoutPersistentRoot(t *testing.T)
 			MemoryLimit: "2Gi",
 		},
 	}
-	vm := generateVirtualMachine(ws, img)
+	vm := generateVirtualMachine(ws, img, nil)
 
 	volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
 	root := volumes[0].(map[string]interface{})
@@ -291,7 +291,7 @@ func TestGenerateVirtualMachineMemoryRequestDecouplesPodFromGuest(t *testing.T) 
 			MemoryRequest:      "5Gi",
 		},
 	}
-	vm := generateVirtualMachine(ws, img)
+	vm := generateVirtualMachine(ws, img, nil)
 
 	// Pod allocation (both request and limit) reflects MemoryRequest...
 	limits, _, _ := unstructured.NestedStringMap(vm.Object, "spec", "template", "spec", "domain", "resources", "limits")
@@ -310,7 +310,7 @@ func TestGenerateVirtualMachineMemoryRequestDecouplesPodFromGuest(t *testing.T) 
 }
 
 func TestCloudInitUserData(t *testing.T) {
-	nilImage := cloudInitUserData(nil)
+	nilImage := cloudInitUserData(nil, nil)
 	if nilImage != "" {
 		t.Errorf("expected empty user-data for nil image, got %q", nilImage)
 	}
@@ -320,29 +320,81 @@ func TestCloudInitUserData(t *testing.T) {
 			Image: "quay.io/containerdisks/debian:12",
 		},
 	}
-	if ud := cloudInitUserData(image); ud != "" {
+	if ud := cloudInitUserData(image, nil); ud != "" {
 		t.Errorf("expected empty user-data without cloud-init opt-in, got %q", ud)
 	}
 
 	image.Spec.DefaultCloudInit = true
 	image.Spec.DefaultUser = "root"
 	image.Spec.DefaultPassword = "debian"
-	if ud := cloudInitUserData(image); ud == "" {
+	if ud := cloudInitUserData(image, nil); ud == "" {
 		t.Error("expected generated user-data when cloud-init defaults are set")
 	} else if !strings.Contains(ud, "list: |\n    root:debian") {
 		t.Errorf("expected root:debian password in generated user-data, got %q", ud)
 	}
 
 	image.Spec.DefaultUserData = "#cloud-config\ncustom: true\n"
-	if ud := cloudInitUserData(image); ud != "#cloud-config\ncustom: true\n" {
+	if ud := cloudInitUserData(image, nil); ud != "#cloud-config\ncustom: true\n" {
 		t.Errorf("explicit DefaultUserData should win, got %q", ud)
 	}
 
 	partial := &kubeworkspacesiov1alpha1.Image{}
 	partial.Spec.DefaultCloudInit = true
 	partial.Spec.DefaultUser = "root"
-	if ud := cloudInitUserData(partial); ud != "" {
+	if ud := cloudInitUserData(partial, nil); ud != "" {
 		t.Errorf("expected empty user-data when password is missing, got %q", ud)
+	}
+}
+
+func TestInjectSSHAuthorizedKeys(t *testing.T) {
+	const k1 = "ssh-ed25519 AAAAZm9vYmFy user1@host"
+	const k2 = "ssh-rsa AAAAcmNkc2E= user2@host"
+
+	if ud := injectSSHAuthorizedKeys("", nil); ud != "" {
+		t.Errorf("no keys => unchanged, got %q", ud)
+	}
+	if ud := injectSSHAuthorizedKeys("#cloud-config\ncustom: true\n", nil); ud != "#cloud-config\ncustom: true\n" {
+		t.Errorf("no keys => unchanged existing data, got %q", ud)
+	}
+
+	// Keys only, no existing data: emit a minimal cloud-config.
+	ud := injectSSHAuthorizedKeys("", []string{k1})
+	if !strings.Contains(ud, "#cloud-config") || !strings.Contains(ud, "ssh_authorized_keys") || !strings.Contains(ud, k1) {
+		t.Errorf("expected minimal cloud-config with key, got %q", ud)
+	}
+
+	// Merge into existing generated user-data (password config preserved).
+	image := &kubeworkspacesiov1alpha1.Image{}
+	image.Spec.DefaultCloudInit = true
+	image.Spec.DefaultUser = "debian"
+	image.Spec.DefaultPassword = "secret"
+	full := cloudInitUserData(image, []string{k1, k2})
+	for _, want := range []string{"#cloud-config", "debian:secret", "ssh_authorized_keys", k1, k2} {
+		if !strings.Contains(full, want) {
+			t.Errorf("expected user-data to contain %q, got %q", want, full)
+		}
+	}
+
+	// Merge into explicit DefaultUserData (the baked debian-gnome case).
+	baked := "#cloud-config\nssh_pwauth: true\npackages:\n  - htop\n"
+	merged := injectSSHAuthorizedKeys(baked, []string{k1, k1})
+	if !strings.Contains(merged, "ssh_authorized_keys") || !strings.Contains(merged, k1) {
+		t.Errorf("expected keys merged into baked user-data, got %q", merged)
+	}
+	if !strings.Contains(merged, "htop") {
+		t.Errorf("expected packages list preserved in merged user-data, got %q", merged)
+	}
+
+	// Dedupe: k1 twice yields one entry.
+	dedup := injectSSHAuthorizedKeys("", []string{k1, k1})
+	if strings.Count(dedup, k1) != 1 {
+		t.Errorf("expected deduplicated keys, got %q", dedup)
+	}
+
+	// Invalid existing YAML is left alone rather than corrupted.
+	broken := injectSSHAuthorizedKeys("#cloud-config\n: :\n  -", []string{k1})
+	if !strings.Contains(broken, ": :") {
+		t.Errorf("expected invalid user-data left as-is, got %q", broken)
 	}
 }
 

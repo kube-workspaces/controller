@@ -26,8 +26,8 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/apimachinery/pkg/api/resource"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
@@ -41,6 +41,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/yaml"
 
 	kubeworkspacesiov1alpha1 "github.com/kube-workspaces/controller/api/v1alpha1"
 )
@@ -96,6 +97,7 @@ type WorkspaceReconciler struct {
 }
 
 // +kubebuilder:rbac:groups=kubeworkspaces.io,resources=images,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups=kubeworkspaces.io,resources=sshkeys,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kubeworkspaces.io,resources=workspaces,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kubeworkspaces.io,resources=workspaces/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=kubeworkspaces.io,resources=workspaces/finalizers,verbs=update
@@ -432,7 +434,18 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 		return 0, nil, err
 	}
 
-	desired := generateVirtualMachine(instance, img)
+	// Seed the workspace owner's SSH public keys into the guest cloud-init so
+	// their sshd trusts them (passwordless SSH into vm workspaces). Keys live
+	// as SshKey CRs in the workspace's (personal) namespace. Changes to keys
+	// change the generated user-data, which on a running VM takes effect at the
+	// next (re)start.
+	sshKeys, err := sshAuthorizedKeysForWorkspace(ctx, r.APIReader, instance.Namespace)
+	if err != nil {
+		log.Error(err, "unable to look up SshKey CRs for cloud-init seeding")
+		return 0, nil, err
+	}
+
+	desired := generateVirtualMachine(instance, img, sshKeys)
 	if err := ctrl.SetControllerReference(instance, desired, r.Scheme); err != nil {
 		return 0, nil, err
 	}
@@ -832,7 +845,7 @@ func generateDeployment(instance *kubeworkspacesiov1alpha1.Workspace) *appsv1.De
 // When cloudUserData is non-empty, a NoCloud datasource with the user-data
 // inlined is attached so cloud-init configures the guest at (re)boot.
 // containerDisk roots are ephemeral, so cloud-init runs on every start.
-func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *kubeworkspacesiov1alpha1.Image) *unstructured.Unstructured {
+func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *kubeworkspacesiov1alpha1.Image, sshKeys []string) *unstructured.Unstructured {
 	stopped := false
 	if _, ok := instance.Annotations[AnnotationStopped]; ok {
 		stopped = true
@@ -949,7 +962,7 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 			"containerDisk": map[string]interface{}{"image": image},
 		})
 	}
-	cloudUserData := cloudInitUserData(img)
+	cloudUserData := cloudInitUserData(img, sshKeys)
 	if cloudUserData != "" {
 		disks = append(disks, map[string]interface{}{
 			"name": "cloudinitdisk",
@@ -1052,21 +1065,40 @@ func imageByRef(ctx context.Context, reader client.Reader, namespace, imageRef s
 	return nil, nil
 }
 
+// sshAuthorizedKeysForWorkspace lists the SSH public keys a workspace owner has
+// saved as SshKey CRs in the workspace's namespace. The API only permits users
+// to create SshKeys in their own personal namespace, so a namespaced list is
+// sufficient.
+func sshAuthorizedKeysForWorkspace(ctx context.Context, reader client.Reader, namespace string) ([]string, error) {
+	keys := &kubeworkspacesiov1alpha1.SshKeyList{}
+	if err := reader.List(ctx, keys, client.InNamespace(namespace)); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(keys.Items))
+	for i := range keys.Items {
+		if pk := keys.Items[i].Spec.PublicKey; pk != "" {
+			out = append(out, pk)
+		}
+	}
+	return out, nil
+}
+
 // cloudInitUserData derives the cloud-init user-data for a VM workspace from
 // the image's declared defaults. Explicit DefaultUserData wins; otherwise, when
 // the image opts in via DefaultCloudInit and provides a user/password, a
 // minimal cloud-config is generated that sets the password on the account (the
-// containerDisk root is ephemeral, so this applies on every boot). Empty
+// containerDisk root is ephemeral, so this applies on every boot). The
+// workspace owner's SSH public keys are merged into the resulting user-data as
+// cloud-init ssh_authorized_keys so the guest's sshd trusts them. Empty
 // user-data means no datasource is attached.
-func cloudInitUserData(image *kubeworkspacesiov1alpha1.Image) string {
+func cloudInitUserData(image *kubeworkspacesiov1alpha1.Image, sshKeys []string) string {
+	userData := ""
 	if image == nil {
-		return ""
-	}
-	if image.Spec.DefaultUserData != "" {
-		return image.Spec.DefaultUserData
-	}
-	if image.Spec.DefaultCloudInit && image.Spec.DefaultUser != "" && image.Spec.DefaultPassword != "" {
-		return fmt.Sprintf("#cloud-config\n"+
+		userData = ""
+	} else if image.Spec.DefaultUserData != "" {
+		userData = image.Spec.DefaultUserData
+	} else if image.Spec.DefaultCloudInit && image.Spec.DefaultUser != "" && image.Spec.DefaultPassword != "" {
+		userData = fmt.Sprintf("#cloud-config\n"+
 			"ssh_pwauth: true\n"+
 			"chpasswd:\n"+
 			"  expire: false\n"+
@@ -1074,7 +1106,54 @@ func cloudInitUserData(image *kubeworkspacesiov1alpha1.Image) string {
 			"    %s:%s\n",
 			image.Spec.DefaultUser, image.Spec.DefaultPassword)
 	}
-	return ""
+	return injectSSHAuthorizedKeys(userData, sshKeys)
+}
+
+// injectSSHAuthorizedKeys merges SSH public keys into a cloud-init user-data
+// string as cloud-init ssh_authorized_keys entries, preserving any existing
+// cloud-config content. Keys are appended to existing ssh_authorized_keys
+// lists; entries already present are deduplicated. When userData is empty and
+// there are keys, a minimal cloud-config carrying only the keys is emitted.
+func injectSSHAuthorizedKeys(userData string, sshKeys []string) string {
+	if len(sshKeys) == 0 {
+		return userData
+	}
+	body := map[string]interface{}{}
+	if userData != "" {
+		trimmed := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(userData), "#cloud-config"))
+		if trimmed != "" && yaml.Unmarshal([]byte(trimmed), &body) != nil {
+			return userData
+		}
+	}
+	existing, _ := body["ssh_authorized_keys"].([]interface{})
+	seen := map[string]bool{}
+	merged := make([]interface{}, 0, len(existing)+len(sshKeys))
+	for _, k := range existing {
+		s, ok := k.(string)
+		if !ok {
+			merged = append(merged, k)
+			continue
+		}
+		if !seen[s] {
+			seen[s] = true
+			merged = append(merged, s)
+		}
+	}
+	for _, k := range sshKeys {
+		if !seen[k] {
+			seen[k] = true
+			merged = append(merged, k)
+		}
+	}
+	if len(merged) == 0 {
+		return userData
+	}
+	body["ssh_authorized_keys"] = merged
+	mergedYAML, err := yaml.Marshal(body)
+	if err != nil {
+		return userData
+	}
+	return "#cloud-config\n" + string(mergedYAML)
 }
 
 // virtualMachineNeedsUpdate compares the running flag and the VMI template.
