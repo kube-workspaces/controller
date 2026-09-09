@@ -32,6 +32,11 @@ import (
 
 const testWorkspaceName = "my-ws"
 
+// testCloudConfig is a minimal cloud-config used across the user-data tests.
+const testCloudConfig = "#cloud-config\ncustom: true\n"
+
+const testMemoryLimit = "4Gi"
+
 const testNvidiaGPUResource = "nvidia.com/gpu"
 
 func testWorkspace(wsType string, annotations map[string]string) *kubeworkspacesiov1alpha1.Workspace {
@@ -201,6 +206,45 @@ func TestGenerateVirtualMachineNoCloudInit(t *testing.T) {
 	}
 }
 
+func TestGenerateVirtualMachineVideoDevice(t *testing.T) {
+	cases := []struct {
+		name string
+		img  *kubeworkspacesiov1alpha1.Image
+		want string // expected domain.devices.video.type; "" means the video key is absent
+	}{
+		{"virtio explicit", &kubeworkspacesiov1alpha1.Image{
+			Spec: kubeworkspacesiov1alpha1.ImageSpec{
+				Image:       "quay.io/containerdisks/fedora:latest",
+				VideoDevice: "virtio",
+			},
+		}, "virtio"},
+		{"nil image", nil, ""},
+		{"empty video device", &kubeworkspacesiov1alpha1.Image{
+			Spec: kubeworkspacesiov1alpha1.ImageSpec{
+				Image: "quay.io/containerdisks/fedora:latest",
+			},
+		}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), tc.img, nil)
+			video, found, _ := unstructured.NestedMap(vm.Object, "spec", "template", "spec", "domain", "devices", "video")
+			if tc.want == "" {
+				if found {
+					t.Errorf("expected no domain.devices.video, got %v", video)
+				}
+				return
+			}
+			if !found {
+				t.Fatalf("expected domain.devices.video %q, key absent", tc.want)
+			}
+			if got, _ := video["type"].(string); got != tc.want {
+				t.Errorf("expected video type %q, got %q", tc.want, got)
+			}
+		})
+	}
+}
+
 // testWorkspaceWithGPU returns a VM workspace whose main container requests
 // the given GPU resource name; count defaults to "1". The resource limit is
 // added so the controller can discover it when building the domain gpus[].
@@ -302,7 +346,7 @@ func TestGenerateVirtualMachinePersistentRootDisk(t *testing.T) {
 			Image:                  "quay.io/containerdisks/debian:12",
 			PersistentRootDisk:     true,
 			PersistentRootDiskSize: "20Gi",
-			MemoryLimit:            "4Gi",
+			MemoryLimit:            testMemoryLimit,
 			DefaultUserData:        "#cloud-config\npackages: [task-gnome-desktop]\n",
 		},
 	}
@@ -342,11 +386,11 @@ func TestGenerateVirtualMachinePersistentRootDisk(t *testing.T) {
 
 	// Memory override is applied to both limits and requests (QoS).
 	limits, _, _ := unstructured.NestedStringMap(vm.Object, "spec", "template", "spec", "domain", "resources", "limits")
-	if limits["memory"] != "4Gi" {
+	if limits["memory"] != testMemoryLimit {
 		t.Errorf("expected memory limit 4Gi, got %v", limits)
 	}
 	reqs, _, _ := unstructured.NestedStringMap(vm.Object, "spec", "template", "spec", "domain", "resources", "requests")
-	if reqs["memory"] != "4Gi" {
+	if reqs["memory"] != testMemoryLimit {
 		t.Errorf("expected memory request 4Gi, got %v", reqs)
 	}
 }
@@ -385,7 +429,7 @@ func TestGenerateVirtualMachineMemoryRequestDecouplesPodFromGuest(t *testing.T) 
 		Spec: kubeworkspacesiov1alpha1.ImageSpec{
 			Image:              "quay.io/containerdisks/debian:13",
 			PersistentRootDisk: true,
-			MemoryLimit:        "4Gi",
+			MemoryLimit:        testMemoryLimit,
 			MemoryRequest:      "5Gi",
 		},
 	}
@@ -402,7 +446,7 @@ func TestGenerateVirtualMachineMemoryRequestDecouplesPodFromGuest(t *testing.T) 
 	}
 	// ...while the guest RAM stays pinned to MemoryLimit.
 	guest, _, _ := unstructured.NestedString(vm.Object, "spec", "template", "spec", "domain", "memory", "guest")
-	if guest != "4Gi" {
+	if guest != testMemoryLimit {
 		t.Errorf("expected guest memory 4Gi, got %q", guest)
 	}
 }
@@ -423,7 +467,7 @@ func TestCloudInitUserData(t *testing.T) {
 	}
 
 	image.Spec.DefaultCloudInit = true
-	image.Spec.DefaultUser = "root"
+	image.Spec.DefaultUser = RootUser
 	image.Spec.DefaultPassword = "debian"
 	if ud := cloudInitUserData(image, nil); ud == "" {
 		t.Error("expected generated user-data when cloud-init defaults are set")
@@ -431,14 +475,14 @@ func TestCloudInitUserData(t *testing.T) {
 		t.Errorf("expected root:debian password in generated user-data, got %q", ud)
 	}
 
-	image.Spec.DefaultUserData = "#cloud-config\ncustom: true\n"
-	if ud := cloudInitUserData(image, nil); ud != "#cloud-config\ncustom: true\n" {
+	image.Spec.DefaultUserData = testCloudConfig
+	if ud := cloudInitUserData(image, nil); ud != testCloudConfig {
 		t.Errorf("explicit DefaultUserData should win, got %q", ud)
 	}
 
 	partial := &kubeworkspacesiov1alpha1.Image{}
 	partial.Spec.DefaultCloudInit = true
-	partial.Spec.DefaultUser = "root"
+	partial.Spec.DefaultUser = RootUser
 	if ud := cloudInitUserData(partial, nil); ud != "" {
 		t.Errorf("expected empty user-data when password is missing, got %q", ud)
 	}
@@ -451,7 +495,7 @@ func TestInjectSSHAuthorizedKeys(t *testing.T) {
 	if ud := injectSSHAuthorizedKeys("", nil, ""); ud != "" {
 		t.Errorf("no keys => unchanged, got %q", ud)
 	}
-	if ud := injectSSHAuthorizedKeys("#cloud-config\ncustom: true\n", nil, ""); ud != "#cloud-config\ncustom: true\n" {
+	if ud := injectSSHAuthorizedKeys(testCloudConfig, nil, ""); ud != testCloudConfig {
 		t.Errorf("no keys => unchanged existing data, got %q", ud)
 	}
 
@@ -482,7 +526,7 @@ func TestInjectSSHAuthorizedKeys(t *testing.T) {
 	}
 
 	// Seed for the root account targets /root/.ssh.
-	root := injectSSHAuthorizedKeys("", []string{k1}, "root")
+	root := injectSSHAuthorizedKeys("", []string{k1}, RootUser)
 	if !strings.Contains(root, "/root/.ssh/authorized_keys") {
 		t.Errorf("expected root account key seeding, got %q", root)
 	}

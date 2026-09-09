@@ -64,6 +64,8 @@ const (
 	LabelWorkspaceName = "workspace-name"
 	// LabelKubevirtVM is set by KubeVirt on virt-launcher pods, naming the VMI
 	LabelKubevirtVM = "vm.kubevirt.io/name"
+	// RootUser is the root account name used for SSH key seeding.
+	RootUser = "root"
 )
 
 // Workspace workload types (spec.type).
@@ -935,6 +937,34 @@ func applyVMScheduling(vmSpec map[string]interface{}, podSpec corev1.PodSpec) {
 	}
 }
 
+// applyDomainMemoryAndCPU pins the guest memory and CPU cores on the VMI
+// template. The guest memory is pinned only when MemoryRequest decouples the
+// pod allocation from the guest RAM (otherwise KubeVirt re-derives the guest
+// from the pod request); the CPU cores are pinned from the container's cpu
+// resource limit so KubeVirt does not ignore it and default to 1 vCPU.
+func applyDomainMemoryAndCPU(vmSpec, resources map[string]interface{}, img *kubeworkspacesiov1alpha1.Image) {
+	domain, _, _ := unstructured.NestedMap(vmSpec, "template", "spec", "domain")
+	if domain == nil {
+		return
+	}
+	if img != nil && img.Spec.MemoryLimit != "" && img.Spec.MemoryRequest != "" {
+		domain["memory"] = map[string]interface{}{"guest": img.Spec.MemoryLimit}
+	}
+	if limits, ok, _ := unstructured.NestedMap(resources, "limits"); ok {
+		if cpuStr, hasCPU := limits["cpu"].(string); hasCPU && cpuStr != "" {
+			q, err := resource.ParseQuantity(cpuStr)
+			if err == nil {
+				cores := q.Value()
+				if cores < 1 {
+					cores = 1
+				}
+				domain["cpu"] = map[string]interface{}{"cores": cores}
+			}
+		}
+	}
+	_ = unstructured.SetNestedField(vmSpec["template"].(map[string]interface{})["spec"].(map[string]interface{}), domain, "domain")
+}
+
 // containerDisk roots are ephemeral, so cloud-init runs on every start.
 func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *kubeworkspacesiov1alpha1.Image, sshKeys []string) *unstructured.Unstructured {
 	stopped := false
@@ -1090,6 +1120,26 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 		vmLabels[k] = v
 	}
 
+	devices := map[string]interface{}{
+		"disks":      disks,
+		"interfaces": interfaces,
+		"gpus":       gpus,
+		"inputs": []interface{}{
+			map[string]interface{}{
+				"type": "tablet",
+				"bus":  "usb",
+				"name": "tablet",
+			},
+		},
+	}
+	// When the image opts into a specific KubeVirt video device (e.g. "virtio"
+	// for the virtio-gpu paravirtual display), pin domain.devices.video.type.
+	// Empty leaves the video device unset, letting KubeVirt auto-attach the
+	// default (VGA for BIOS, bochs for EFI).
+	if img != nil && img.Spec.VideoDevice != "" {
+		devices["video"] = map[string]interface{}{"type": img.Spec.VideoDevice}
+	}
+
 	vmSpec := map[string]interface{}{
 		"running": !stopped,
 		"template": map[string]interface{}{
@@ -1097,18 +1147,7 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 			"spec": map[string]interface{}{
 				"domain": map[string]interface{}{
 					"resources": resources,
-					"devices": map[string]interface{}{
-						"disks":      disks,
-						"interfaces": interfaces,
-						"gpus":       gpus,
-						"inputs": []interface{}{
-							map[string]interface{}{
-								"type": "tablet",
-								"bus":  "usb",
-								"name": "tablet",
-							},
-						},
-					},
+					"devices":   devices,
 				},
 				"networks": networks,
 				"volumes":  volumes,
@@ -1124,25 +1163,8 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 	// the inflated pod request. Also pin the domain CPU cores from the container
 	// resource limits — without domain.cpu.cores KubeVirt ignores the CPU limit
 	// and defaults to 1 vCPU.
-	domain, _, _ := unstructured.NestedMap(vmSpec, "template", "spec", "domain")
-	if domain != nil {
-		if img != nil && img.Spec.MemoryLimit != "" && img.Spec.MemoryRequest != "" {
-			domain["memory"] = map[string]interface{}{"guest": img.Spec.MemoryLimit}
-		}
-		if limits, ok, _ := unstructured.NestedMap(resources, "limits"); ok {
-			if cpuStr, hasCPU := limits["cpu"].(string); hasCPU && cpuStr != "" {
-				q, err := resource.ParseQuantity(cpuStr)
-				if err == nil {
-					cores := q.Value()
-					if cores < 1 {
-						cores = 1
-					}
-					domain["cpu"] = map[string]interface{}{"cores": cores}
-				}
-			}
-		}
-		_ = unstructured.SetNestedField(vmSpec["template"].(map[string]interface{})["spec"].(map[string]interface{}), domain, "domain")
-	}
+	applyDomainMemoryAndCPU(vmSpec, resources, img)
+
 	if len(dataVolumeTemplates) > 0 {
 		vmSpec["dataVolumeTemplates"] = dataVolumeTemplates
 	}
@@ -1307,7 +1329,7 @@ func runCmdSeeding(user string, sshKeys []string) string {
 		return ""
 	}
 	sshDir := "/home/" + user + "/.ssh"
-	if user == "root" {
+	if user == RootUser {
 		sshDir = "/root/.ssh"
 	}
 	blob := base64.StdEncoding.EncodeToString([]byte(strings.Join(sshKeys, "\n")))

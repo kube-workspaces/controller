@@ -150,6 +150,16 @@ type ImageSpec struct {
 	// MemoryLimit (or the container defaults when MemoryLimit is empty).
 	// +optional
 	MemoryRequest string `json:"memoryRequest,omitempty"`
+	// VideoDevice overrides the KubeVirt domain video device type for vm
+	// workspaces (sets domain.devices.video.type). "virtio" attaches the
+	// virtio-gpu paravirtual display (recommended for modern desktop guests
+	// with virtio graphics drivers); other valid values are "vga", "bochs",
+	// "cirrus" and "ramfb". Empty uses KubeVirt's default auto-attach (VGA for
+	// BIOS, bochs for EFI) and leaves domain.devices.video unset. Ignored for
+	// non-vm workspaces.
+	// +kubebuilder:validation:Enum=virtio;vga;bochs;cirrus;ramfb
+	// +optional
+	VideoDevice string `json:"videoDevice,omitempty"`
 }
 
 // ImageLink represents a named URL link for an image.

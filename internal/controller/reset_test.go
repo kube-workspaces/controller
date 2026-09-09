@@ -65,7 +65,7 @@ func TestHandleResetNoAnnotation(t *testing.T) {
 	if handled {
 		t.Error("expected not handled without the reset annotation")
 	}
-	if res.Requeue || res.RequeueAfter != 0 {
+	if res.RequeueAfter != 0 {
 		t.Errorf("expected no requeue, got %+v", res)
 	}
 }
