@@ -907,6 +907,34 @@ func isGPUResource(name string) bool {
 	return ok && vendor == "gpu"
 }
 
+// vmScheduling fields carries the workspace's scheduling constraints into the
+// VMI template so the virt-launcher pod can land on dedicated/tainted GPU
+// nodes (the api auto-adds the GPU resource toleration). KubeVirt's VMI spec
+// supports tolerations and nodeSelector just like a PodSpec.
+func applyVMScheduling(vmSpec map[string]interface{}, podSpec corev1.PodSpec) {
+	if len(podSpec.Tolerations) > 0 {
+		tols := make([]interface{}, 0, len(podSpec.Tolerations))
+		for _, t := range podSpec.Tolerations {
+			tol := map[string]interface{}{
+				"key":      t.Key,
+				"operator": string(t.Operator),
+				"effect":   string(t.Effect),
+			}
+			if t.Value != "" {
+				tol["value"] = t.Value
+			}
+			if t.TolerationSeconds != nil {
+				tol["tolerationSeconds"] = *t.TolerationSeconds
+			}
+			tols = append(tols, tol)
+		}
+		_ = unstructured.SetNestedSlice(vmSpec, tols, "template", "spec", "tolerations")
+	}
+	if len(podSpec.NodeSelector) > 0 {
+		_ = unstructured.SetNestedStringMap(vmSpec, podSpec.NodeSelector, "template", "spec", "nodeSelector")
+	}
+}
+
 // containerDisk roots are ephemeral, so cloud-init runs on every start.
 func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *kubeworkspacesiov1alpha1.Image, sshKeys []string) *unstructured.Unstructured {
 	stopped := false
@@ -1090,27 +1118,7 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 	// Carry the workspace's scheduling constraints (nodeSelector, tolerations —
 	// including the auto-added GPU toleration) into the VMI template so the
 	// virt-launcher pod can land on dedicated/tainted GPU nodes.
-	if len(podSpec.Tolerations) > 0 {
-		tols := make([]interface{}, 0, len(podSpec.Tolerations))
-		for _, t := range podSpec.Tolerations {
-			tol := map[string]interface{}{
-				"key":      t.Key,
-				"operator": string(t.Operator),
-				"effect":   string(t.Effect),
-			}
-			if t.Value != "" {
-				tol["value"] = t.Value
-			}
-			if t.TolerationSeconds != nil {
-				tol["tolerationSeconds"] = *t.TolerationSeconds
-			}
-			tols = append(tols, tol)
-		}
-		_ = unstructured.SetNestedSlice(vmSpec, tols, "template", "spec", "tolerations")
-	}
-	if len(podSpec.NodeSelector) > 0 {
-		_ = unstructured.SetNestedStringMap(vmSpec, podSpec.NodeSelector, "template", "spec", "nodeSelector")
-	}
+	applyVMScheduling(vmSpec, podSpec)
 	// When MemoryRequest decouples the pod allocation from the guest RAM, pin
 	// the domain memory explicitly so KubeVirt does not re-derive the guest from
 	// the inflated pod request. Also pin the domain CPU cores from the container
