@@ -1140,6 +1140,13 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 		devices["video"] = map[string]interface{}{"type": img.Spec.VideoDevice}
 	}
 
+	// When the image specifies a sound device model (e.g. "ac97" or "ich9"),
+	// add it to the domain devices. This activates QEMU's VNC audio
+	// pseudo-encoding, enabling Tier 0 audio playback in the desktop client.
+	if img != nil && img.Spec.SoundDevice != "" {
+		devices["sound"] = map[string]interface{}{"model": img.Spec.SoundDevice}
+	}
+
 	vmSpec := map[string]interface{}{
 		"running": !stopped,
 		"template": map[string]interface{}{

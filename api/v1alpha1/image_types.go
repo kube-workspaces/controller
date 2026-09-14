@@ -160,6 +160,15 @@ type ImageSpec struct {
 	// +kubebuilder:validation:Enum=virtio;vga;bochs;cirrus;ramfb
 	// +optional
 	VideoDevice string `json:"videoDevice,omitempty"`
+	// SoundDevice overrides the KubeVirt domain sound device model for vm
+	// workspaces (sets domain.devices.sound.model). Valid values are "ac97"
+	// and "ich9". Empty uses KubeVirt's default (no sound device) and leaves
+	// domain.devices.sound unset. Ignored for non-vm workspaces. Enabling
+	// this activates the QEMU VNC audio pseudo-encoding for Tier 0 audio
+	// playback.
+	// +kubebuilder:validation:Enum=ac97;ich9
+	// +optional
+	SoundDevice string `json:"soundDevice,omitempty"`
 }
 
 // ImageLink represents a named URL link for an image.

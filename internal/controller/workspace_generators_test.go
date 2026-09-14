@@ -245,6 +245,51 @@ func TestGenerateVirtualMachineVideoDevice(t *testing.T) {
 	}
 }
 
+func TestGenerateVirtualMachineSoundDevice(t *testing.T) {
+	cases := []struct {
+		name  string
+		img   *kubeworkspacesiov1alpha1.Image
+		want  string // expected domain.devices.sound.model; "" means the sound key is absent
+	}{
+		{"ac97 explicit", &kubeworkspacesiov1alpha1.Image{
+			Spec: kubeworkspacesiov1alpha1.ImageSpec{
+				Image:       "quay.io/containerdisks/fedora:latest",
+				SoundDevice: "ac97",
+			},
+		}, "ac97"},
+		{"ich9 explicit", &kubeworkspacesiov1alpha1.Image{
+			Spec: kubeworkspacesiov1alpha1.ImageSpec{
+				Image:       "quay.io/containerdisks/fedora:latest",
+				SoundDevice: "ich9",
+			},
+		}, "ich9"},
+		{"nil image", nil, ""},
+		{"empty sound device", &kubeworkspacesiov1alpha1.Image{
+			Spec: kubeworkspacesiov1alpha1.ImageSpec{
+				Image: "quay.io/containerdisks/fedora:latest",
+			},
+		}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), tc.img, nil)
+			sound, found, _ := unstructured.NestedMap(vm.Object, "spec", "template", "spec", "domain", "devices", "sound")
+			if tc.want == "" {
+				if found {
+					t.Errorf("expected no domain.devices.sound, got %v", sound)
+				}
+				return
+			}
+			if !found {
+				t.Fatalf("expected domain.devices.sound %q, key absent", tc.want)
+			}
+			if got, _ := sound["model"].(string); got != tc.want {
+				t.Errorf("expected sound model %q, got %q", tc.want, got)
+			}
+		})
+	}
+}
+
 // testWorkspaceWithGPU returns a VM workspace whose main container requests
 // the given GPU resource name; count defaults to "1". The resource limit is
 // added so the controller can discover it when building the domain gpus[].
