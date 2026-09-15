@@ -1309,7 +1309,7 @@ func cloudInitVolume(workspaceName, cloudUserData string) map[string]interface{}
 		}
 	}
 	return map[string]interface{}{
-		"name":              "cloudinitdisk",
+		"name":             "cloudinitdisk",
 		"cloudInitNoCloud": noCloud,
 	}
 }

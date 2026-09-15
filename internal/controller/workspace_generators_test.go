@@ -317,9 +317,9 @@ func TestGenerateVirtualMachineVideoDevice(t *testing.T) {
 
 func TestGenerateVirtualMachineSoundDevice(t *testing.T) {
 	cases := []struct {
-		name  string
-		img   *kubeworkspacesiov1alpha1.Image
-		want  string // expected domain.devices.sound.model; "" means the sound key is absent
+		name string
+		img  *kubeworkspacesiov1alpha1.Image
+		want string // expected domain.devices.sound.model; "" means the sound key is absent
 	}{
 		{"ac97 explicit", &kubeworkspacesiov1alpha1.Image{
 			Spec: kubeworkspacesiov1alpha1.ImageSpec{
