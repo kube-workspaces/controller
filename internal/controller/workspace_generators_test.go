@@ -356,6 +356,9 @@ func TestGenerateVirtualMachineSoundDevice(t *testing.T) {
 			if got, _ := sound["model"].(string); got != tc.want {
 				t.Errorf("expected sound model %q, got %q", tc.want, got)
 			}
+			if got, _ := sound["name"].(string); got != "audiodev" {
+				t.Errorf("expected sound name %q, got %q", "audiodev", got)
+			}
 		})
 	}
 }
