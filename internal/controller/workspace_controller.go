@@ -109,6 +109,7 @@ type WorkspaceReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=events,verbs=get;list;watch;create;patch
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines,verbs=get;list;watch;create;update;patch;delete
@@ -426,9 +427,11 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 	log := logf.FromContext(ctx)
 
 	// Seed cloud-init user-data from the Image CR's declared defaults (when the
-	// image opts in). The user-data is inlined in the VM's NoCloud datasource.
-	// The Image CR also drives the persistent root-disk (DataVolume) and memory
-	// overrides for desktop images.
+	// image opts in). The user-data is attached to the VM's NoCloud datasource,
+	// inlined when it is small and served from a generated Secret otherwise (the
+	// KubeVirt admission webhook rejects inline user-data larger than 2048
+	// bytes). The Image CR also drives the persistent root-disk (DataVolume) and
+	// memory overrides for desktop images.
 	imageRef := ""
 	if len(instance.Spec.Template.Spec.Containers) > 0 {
 		imageRef = instance.Spec.Template.Spec.Containers[0].Image
@@ -447,6 +450,15 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 	sshKeys, err := sshAuthorizedKeysForWorkspace(ctx, r.APIReader, instance.Namespace)
 	if err != nil {
 		log.Error(err, "unable to look up SshKey CRs for cloud-init seeding")
+		return 0, nil, err
+	}
+
+	// Large user-data is served from a Secret generated below. Reconcile it
+	// before building the VM so the referent exists (ideally) before the
+	// VirtualMachine that references it.
+	cloudUserData := cloudInitUserData(img, sshKeys)
+	if err := r.reconcileCloudInitSecret(ctx, instance, cloudUserData); err != nil {
+		log.Error(err, "unable to reconcile cloud-init Secret")
 		return 0, nil, err
 	}
 
@@ -498,6 +510,58 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 		readyReplicas = 1
 	}
 	return readyReplicas, pod, nil
+}
+
+// reconcileCloudInitSecret backs a VM workspace's cloud-init user-data with a
+// Secret when the payload exceeds the KubeVirt admission webhook's inline size
+// limit. The Secret is owned by the Workspace so it is garbage collected with
+// the workspace, and its data is always refreshed to match the user-data the VM
+// references. When the user-data shrinks back below the inline limit the
+// Secret is deleted so no stale referent lingers.
+func (r *WorkspaceReconciler) reconcileCloudInitSecret(ctx context.Context, instance *kubeworkspacesiov1alpha1.Workspace, cloudUserData string) error {
+	name := cloudInitSecretName(instance.Name)
+
+	if len(cloudUserData) <= inlineCloudInitMaxBytes {
+		secret := &corev1.Secret{}
+		err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: instance.Namespace}, secret)
+		if apierrs.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		log := logf.FromContext(ctx)
+		log.Info("Deleting stale cloud-init Secret", "namespace", instance.Namespace, "name", name)
+		return r.Delete(ctx, secret)
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: instance.Namespace,
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{cloudInitSecretKey: []byte(cloudUserData)},
+	}
+	if err := ctrl.SetControllerReference(instance, secret, r.Scheme); err != nil {
+		return err
+	}
+
+	found := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: instance.Namespace}, found)
+	if apierrs.IsNotFound(err) {
+		log := logf.FromContext(ctx)
+		log.Info("Creating cloud-init Secret", "namespace", instance.Namespace, "name", name)
+		return r.Create(ctx, secret)
+	}
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(found.Data, secret.Data) {
+		found.Data = secret.Data
+		return r.Update(ctx, found)
+	}
+	return nil
 }
 
 // handleReset re-provisions a vm workspace when a reset has been requested.
@@ -1103,12 +1167,7 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 			"name": "cloudinitdisk",
 			"disk": map[string]interface{}{"bus": "virtio"},
 		})
-		volumes = append(volumes, map[string]interface{}{
-			"name": "cloudinitdisk",
-			"cloudInitNoCloud": map[string]interface{}{
-				"userData": cloudUserData,
-			},
-		})
+		volumes = append(volumes, cloudInitVolume(instance.Name, cloudUserData))
 	}
 
 	// VMI template labels: workspace-name drives the controller's pod watch;
@@ -1220,6 +1279,39 @@ func sshAuthorizedKeysForWorkspace(ctx context.Context, reader client.Reader, na
 		}
 	}
 	return out, nil
+}
+
+// cloudInitSecretKey is the Secret data key KubeVirt's NoCloud datasource
+// reads when the volume references a Secret. It is the datasource's name.
+const cloudInitSecretKey = "userdata"
+
+// inlineCloudInitMaxBytes is the largest cloud-init user-data payload KubeVirt
+// admits when it is inlined in the NoCloud datasource. Larger user-data must be
+// served from a Secret (cloudInitNoCloud.secretRef), which has no size limit of
+// its own.
+const inlineCloudInitMaxBytes = 2048
+
+// cloudInitSecretName returns the name of the cloud-init Secret backing a VM
+// workspace's user-data. It is derived from the workspace name so reconcile is
+// idempotent.
+func cloudInitSecretName(workspaceName string) string {
+	return workspaceName + "-cloudinit"
+}
+
+// cloudInitVolume builds the NoCloud datasource volume for a VM workspace's
+// user-data, inlining the payload while it fits within KubeVirt's inline size
+// limit and referencing a Secret otherwise.
+func cloudInitVolume(workspaceName, cloudUserData string) map[string]interface{} {
+	noCloud := map[string]interface{}{"userData": cloudUserData}
+	if len(cloudUserData) > inlineCloudInitMaxBytes {
+		noCloud = map[string]interface{}{
+			"secretRef": map[string]interface{}{"name": cloudInitSecretName(workspaceName)},
+		}
+	}
+	return map[string]interface{}{
+		"name":              "cloudinitdisk",
+		"cloudInitNoCloud": noCloud,
+	}
 }
 
 // cloudInitUserData derives the cloud-init user-data for a VM workspace from

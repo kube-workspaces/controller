@@ -206,6 +206,76 @@ func TestGenerateVirtualMachineNoCloudInit(t *testing.T) {
 	}
 }
 
+func largeCloudConfig(t *testing.T) string {
+	t.Helper()
+	return strings.Repeat("y", inlineCloudInitMaxBytes+1)
+}
+
+func TestCloudInitVolumeFitsInline(t *testing.T) {
+	ci, ok := cloudInitVolume(testWorkspaceName, testCloudConfig)["cloudInitNoCloud"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected cloudInitNoCloud volume for small user-data")
+	}
+	if _, hasUserData := ci["userData"]; !hasUserData {
+		t.Fatalf("expected inline userData for a small payload, got %v", ci)
+	}
+	if _, hasSecret := ci["secretRef"]; hasSecret {
+		t.Fatalf("small user-data must not reference a Secret, got %v", ci)
+	}
+}
+
+func TestCloudInitVolumeUsesSecretRefWhenLarge(t *testing.T) {
+	ci, ok := cloudInitVolume(testWorkspaceName, largeCloudConfig(t))["cloudInitNoCloud"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected cloudInitNoCloud volume for large user-data")
+	}
+	if _, hasUserData := ci["userData"]; hasUserData {
+		t.Fatalf("large user-data must not be inlined, got %v", ci)
+	}
+	ref, hasSecret := ci["secretRef"].(map[string]interface{})
+	if !hasSecret {
+		t.Fatalf("expected secretRef for large user-data, got %v", ci)
+	}
+	if got := ref["name"]; got != cloudInitSecretName(testWorkspaceName) || got != testWorkspaceName+"-cloudinit" {
+		t.Errorf("unexpected secret name: %v", got)
+	}
+}
+
+func TestGenerateVirtualMachineCloudInitSecretRef(t *testing.T) {
+	ws := testWorkspace(WorkspaceTypeVM, nil)
+	img := &kubeworkspacesiov1alpha1.Image{
+		Spec: kubeworkspacesiov1alpha1.ImageSpec{
+			Image:           "quay.io/containerdisks/fedora:latest",
+			DefaultUserData: largeCloudConfig(t),
+		},
+	}
+	vm := generateVirtualMachine(ws, img, nil)
+
+	volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
+	if len(volumes) != 2 {
+		t.Fatalf("expected 2 volumes with cloud-init, got %d", len(volumes))
+	}
+	ci, ok := volumes[1].(map[string]interface{})["cloudInitNoCloud"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected cloudInitNoCloud volume, got %v", volumes[1])
+	}
+	if _, hasUserData := ci["userData"]; hasUserData {
+		t.Fatalf("large user-data must not be inlined, got %v", ci)
+	}
+	ref, hasSecret := ci["secretRef"].(map[string]interface{})
+	if !hasSecret {
+		t.Fatalf("expected secretRef for large user-data, got %v", ci)
+	}
+	if got := ref["name"]; got != cloudInitSecretName(testWorkspaceName) {
+		t.Errorf("unexpected secret name: %v", got)
+	}
+
+	disks, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "domain", "devices", "disks")
+	if len(disks) != 2 || disks[1].(map[string]interface{})["name"] != "cloudinitdisk" {
+		t.Errorf("unexpected disks: %v", disks)
+	}
+}
+
 func TestGenerateVirtualMachineVideoDevice(t *testing.T) {
 	cases := []struct {
 		name string
