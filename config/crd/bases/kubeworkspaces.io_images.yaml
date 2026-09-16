@@ -1729,6 +1729,26 @@ spec:
                       type: string
                     type: array
                 type: object
+              remoteDesktop:
+                description: RemoteDesktop configuration for this image (e.g. Tier
+                  1 transport).
+                properties:
+                  path:
+                    description: Path relative to the agent's base URL (e.g. "/").
+                    type: string
+                  port:
+                    description: Port the agent listens on in the guest.
+                    format: int32
+                    type: integer
+                  protocol:
+                    description: Protocol name (e.g. "selkies").
+                    enum:
+                    - selkies
+                    type: string
+                required:
+                - port
+                - protocol
+                type: object
               soundDevice:
                 description: |-
                   SoundDevice overrides the KubeVirt domain sound device model for vm

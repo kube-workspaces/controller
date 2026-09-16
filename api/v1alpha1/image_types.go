@@ -169,6 +169,21 @@ type ImageSpec struct {
 	// +kubebuilder:validation:Enum=ac97;ich9
 	// +optional
 	SoundDevice string `json:"soundDevice,omitempty"`
+	// RemoteDesktop configuration for this image (e.g. Tier 1 transport).
+	// +optional
+	RemoteDesktop *ImageRemoteDesktop `json:"remoteDesktop,omitempty"`
+}
+
+// ImageRemoteDesktop describes an in-guest remote desktop agent (Tier 1 transport).
+type ImageRemoteDesktop struct {
+	// Protocol name (e.g. "selkies").
+	// +kubebuilder:validation:Enum=selkies
+	Protocol string `json:"protocol"`
+	// Port the agent listens on in the guest.
+	Port int32 `json:"port"`
+	// Path relative to the agent's base URL (e.g. "/").
+	// +optional
+	Path string `json:"path,omitempty"`
 }
 
 // ImageLink represents a named URL link for an image.
