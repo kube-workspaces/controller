@@ -39,6 +39,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -126,7 +127,7 @@ type WorkspaceReconciler struct {
 func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	reconcileStart := time.Now()
 	log := logf.FromContext(ctx)
-	log.Info("Reconciliation loop started")
+	log.Info("Reconciliation loop started", "namespace", req.Namespace, "name", req.Name)
 
 	// Fetch the Workspace instance
 	instance := &kubeworkspacesiov1alpha1.Workspace{}
@@ -249,8 +250,18 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 					annotations = make(map[string]string)
 				}
 				annotations["kubeworkspaces.io/ready-time-recorded"] = "true"
-				instance.Annotations = annotations
-				if err := r.Update(ctx, instance); err != nil {
+				err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+					latest := &kubeworkspacesiov1alpha1.Workspace{}
+					if err := r.Get(ctx, req.NamespacedName, latest); err != nil {
+						return err
+					}
+					if latest.Annotations == nil {
+						latest.Annotations = make(map[string]string)
+					}
+					latest.Annotations["kubeworkspaces.io/ready-time-recorded"] = "true"
+					return r.Update(ctx, latest)
+				})
+				if err != nil {
 					log.Error(err, "unable to set ready-time-recorded annotation")
 				}
 			}
@@ -436,10 +447,16 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 	if len(instance.Spec.Template.Spec.Containers) > 0 {
 		imageRef = instance.Spec.Template.Spec.Containers[0].Image
 	}
-	img, err := imageByRef(ctx, r.APIReader, instance.Namespace, imageRef)
+	log.Info("Looking up Image CR", "imageRef", imageRef)
+	img, err := imageByRef(ctx, r.Client, instance.Namespace, imageRef)
 	if err != nil {
 		log.Error(err, "unable to look up Image CR for cloud-init seeding")
 		return 0, nil, err
+	}
+	if img == nil {
+		log.Info("Image CR not found for image ref", "image", imageRef)
+	} else {
+		log.Info("Found Image CR", "name", img.Name, "image", img.Spec.Image, "memoryLimit", img.Spec.MemoryLimit)
 	}
 
 	// Seed the workspace owner's SSH public keys into the guest cloud-init so
@@ -447,7 +464,7 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 	// as SshKey CRs in the workspace's (personal) namespace. Changes to keys
 	// change the generated user-data, which on a running VM takes effect at the
 	// next (re)start.
-	sshKeys, err := sshAuthorizedKeysForWorkspace(ctx, r.APIReader, instance.Namespace)
+	sshKeys, err := sshAuthorizedKeysForWorkspace(ctx, r.Client, instance.Namespace)
 	if err != nil {
 		log.Error(err, "unable to look up SshKey CRs for cloud-init seeding")
 		return 0, nil, err
@@ -486,11 +503,18 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 
 	if !justCreated && virtualMachineNeedsUpdate(desired, found) {
 		log.Info("Updating VirtualMachine", "namespace", desired.GetNamespace(), "name", desired.GetName())
-		found.Object["spec"] = desired.Object["spec"]
-		if err := r.Update(ctx, found); err != nil {
-			log.Error(err, "unable to update VirtualMachine")
-			return 0, nil, err
-		}
+		return 0, nil, retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			latest := &unstructured.Unstructured{}
+			latest.SetGroupVersionKind(kubeVirtVirtualMachineGVK)
+			if err := r.Get(ctx, types.NamespacedName{Name: desired.GetName(), Namespace: desired.GetNamespace()}, latest); err != nil {
+				return err
+			}
+			if !virtualMachineNeedsUpdate(desired, latest) {
+				return nil
+			}
+			latest.Object["spec"] = desired.Object["spec"]
+			return r.Update(ctx, latest)
+		})
 	}
 
 	// The launcher pod only exists while the VM is running.
@@ -745,8 +769,15 @@ func (r *WorkspaceReconciler) updateWorkspaceStatus(ctx context.Context,
 	// Only update if status has changed
 	if !reflect.DeepEqual(ws.Status, status) {
 		log.Info("Updating Workspace CR Status")
-		ws.Status = status
-		return r.Status().Update(ctx, ws)
+		return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			// Fetch fresh instance to avoid conflict
+			latest := &kubeworkspacesiov1alpha1.Workspace{}
+			if err := r.Get(ctx, types.NamespacedName{Name: ws.Name, Namespace: ws.Namespace}, latest); err != nil {
+				return err
+			}
+			latest.Status = status
+			return r.Status().Update(ctx, latest)
+		})
 	}
 
 	return nil
@@ -1255,7 +1286,7 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 // or nil when no image matches (in which case cloud-init seeding is skipped).
 func imageByRef(ctx context.Context, reader client.Reader, namespace, imageRef string) (*kubeworkspacesiov1alpha1.Image, error) {
 	images := &kubeworkspacesiov1alpha1.ImageList{}
-	if err := reader.List(ctx, images, client.InNamespace(namespace)); err != nil {
+	if err := reader.List(ctx, images); err != nil {
 		return nil, err
 	}
 	for i := range images.Items {
@@ -1582,12 +1613,47 @@ func (r *WorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return nil
 	})
 
-	return ctrl.NewControllerManagedBy(mgr).
+	// Map function to convert VirtualMachine events to reconciliation requests
+	mapVMToRequest := handler.MapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
+		return []reconcile.Request{
+			{NamespacedName: types.NamespacedName{
+				Name:      object.GetName(),
+				Namespace: object.GetNamespace(),
+			}},
+		}
+	})
+
+	// Map function to convert VirtualMachineInstance events to reconciliation requests
+	mapVMIToRequest := handler.MapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
+		if nbName, ok := object.GetLabels()[LabelWorkspaceName]; ok {
+			return []reconcile.Request{
+				{NamespacedName: types.NamespacedName{
+					Name:      nbName,
+					Namespace: object.GetNamespace(),
+				}},
+			}
+		}
+		return nil
+	})
+
+	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&kubeworkspacesiov1alpha1.Workspace{}).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
-		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(mapPodToRequest)).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(mapPodToRequest))
+
+	// Watch KubeVirt types
+	vm := &unstructured.Unstructured{}
+	vm.SetGroupVersionKind(kubeVirtVirtualMachineGVK)
+	vmi := &unstructured.Unstructured{}
+	vmi.SetGroupVersionKind(kubeVirtVirtualMachineInstanceGVK)
+
+	builder = builder.
+		Watches(vm, handler.EnqueueRequestsFromMapFunc(mapVMToRequest)).
+		Watches(vmi, handler.EnqueueRequestsFromMapFunc(mapVMIToRequest))
+
+	return builder.
 		Named("workspace").
 		Complete(r)
 }
