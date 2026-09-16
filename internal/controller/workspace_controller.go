@@ -55,6 +55,11 @@ const (
 	DefaultContainerPort = 8080
 	// DefaultServingPort is the port exposed by the Service
 	DefaultServingPort = 80
+	// DefaultGuestMemory is the fallback VMI memory when neither the
+	// workspace template nor the Image CR pins any — KubeVirt rejects a VMI
+	// with no memory at all, so a missing Image CR (e.g. a mismatched image
+	// reference) must not produce an unschedulable workspace.
+	DefaultGuestMemory = "2Gi"
 	// AnnotationStopped is the annotation that indicates a workspace is stopped
 	AnnotationStopped = "kubeworkspaces.io/stopped"
 	// AnnotationReset is the annotation that requests a reset (re-provisioning
@@ -1108,6 +1113,26 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 		limits["memory"] = podMem
 		resources["limits"] = limits
 		reqMap["memory"] = podMem
+		resources["requests"] = reqMap
+	}
+
+	// KubeVirt's admission webhook rejects a VMI with no memory requested. When
+	// neither the workspace template nor the Image CR pinned any, fall back to
+	// the default so the workspace still boots.
+	if _, ok := resources["limits"].(map[string]interface{})["memory"]; !ok {
+		limits, _, _ := unstructured.NestedMap(resources, "limits")
+		if limits == nil {
+			limits = map[string]interface{}{}
+		}
+		limits["memory"] = DefaultGuestMemory
+		resources["limits"] = limits
+	}
+	if _, ok := resources["requests"].(map[string]interface{})["memory"]; !ok {
+		reqMap, _, _ := unstructured.NestedMap(resources, "requests")
+		if reqMap == nil {
+			reqMap = map[string]interface{}{}
+		}
+		reqMap["memory"] = DefaultGuestMemory
 		resources["requests"] = reqMap
 	}
 
