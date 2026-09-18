@@ -30,6 +30,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
+	meta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -254,7 +255,7 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 				if annotations == nil {
 					annotations = make(map[string]string)
 				}
-				annotations["kubeworkspaces.io/ready-time-recorded"] = "true"
+				annotations["kubeworkspaces.io/ready-time-recorded"] = LabelValueTrue
 				err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 					latest := &kubeworkspacesiov1alpha1.Workspace{}
 					if err := r.Get(ctx, req.NamespacedName, latest); err != nil {
@@ -263,7 +264,7 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 					if latest.Annotations == nil {
 						latest.Annotations = make(map[string]string)
 					}
-					latest.Annotations["kubeworkspaces.io/ready-time-recorded"] = "true"
+					latest.Annotations["kubeworkspaces.io/ready-time-recorded"] = LabelValueTrue
 					return r.Update(ctx, latest)
 				})
 				if err != nil {
@@ -453,7 +454,7 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 		imageRef = instance.Spec.Template.Spec.Containers[0].Image
 	}
 	log.Info("Looking up Image CR", "imageRef", imageRef)
-	img, err := imageByRef(ctx, r.Client, instance.Namespace, imageRef)
+	img, err := imageByRef(ctx, r.Client, imageRef)
 	if err != nil {
 		log.Error(err, "unable to look up Image CR for cloud-init seeding")
 		return 0, nil, err
@@ -1075,66 +1076,7 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 	podSpec := instance.Spec.Template.Spec
 
 	// Domain resources from the main container's requests/limits.
-	resources := map[string]interface{}{}
-	if len(podSpec.Containers) > 0 {
-		if req := podSpec.Containers[0].Resources.Requests; len(req) > 0 {
-			requests := map[string]interface{}{}
-			for k, v := range req {
-				requests[k.String()] = v.String()
-			}
-			resources["requests"] = requests
-		}
-		if lim := podSpec.Containers[0].Resources.Limits; len(lim) > 0 {
-			limits := map[string]interface{}{}
-			for k, v := range lim {
-				limits[k.String()] = v.String()
-			}
-			resources["limits"] = limits
-		}
-	}
-	// Desktop images may need more memory than the container defaults. The Image
-	// CR can raise the guest RAM via MemoryLimit (kept equal to the pod request
-	// so QoS keeps the workload Guaranteed) and optionally decouple the pod
-	// allocation with MemoryRequest so the virt-launcher pod is granted headroom
-	// above the guest RAM for qemu overhead, without inflating guest memory.
-	if img != nil && img.Spec.MemoryLimit != "" {
-		limits, _, _ := unstructured.NestedMap(resources, "limits")
-		if limits == nil {
-			limits = map[string]interface{}{}
-		}
-		reqMap, _, _ := unstructured.NestedMap(resources, "requests")
-		if reqMap == nil {
-			reqMap = map[string]interface{}{}
-		}
-		podMem := img.Spec.MemoryLimit
-		if img.Spec.MemoryRequest != "" {
-			podMem = img.Spec.MemoryRequest
-		}
-		limits["memory"] = podMem
-		resources["limits"] = limits
-		reqMap["memory"] = podMem
-		resources["requests"] = reqMap
-	}
-
-	// KubeVirt's admission webhook rejects a VMI with no memory requested. When
-	// neither the workspace template nor the Image CR pinned any, fall back to
-	// the default so the workspace still boots.
-	if _, ok := resources["limits"].(map[string]interface{})["memory"]; !ok {
-		limits, _, _ := unstructured.NestedMap(resources, "limits")
-		if limits == nil {
-			limits = map[string]interface{}{}
-		}
-		limits["memory"] = DefaultGuestMemory
-		resources["limits"] = limits
-	}
-	if _, ok := resources["requests"].(map[string]interface{})["memory"]; !ok {
-		reqMap, _, _ := unstructured.NestedMap(resources, "requests")
-		if reqMap == nil {
-			reqMap = map[string]interface{}{}
-		}
-		reqMap["memory"] = DefaultGuestMemory
-		resources["requests"] = reqMap
-	}
+	resources := vmDomainResources(podSpec, img)
 
 	// GPU passthrough: derive the KubeVirt gpus[] declaration from the main
 	// container's GPU resource limits. The same limits are already copied into
@@ -1307,9 +1249,76 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 	return vm
 }
 
+// vmDomainResources assembles the KubeVirt domain.resources declaration from
+// the main container's requests/limits, then applies desktop-image overrides:
+// the Image CR can raise the guest RAM via MemoryLimit (kept equal to the pod
+// request so QoS keeps the workload Guaranteed) and optionally decouple the pod
+// allocation with MemoryRequest so the virt-launcher pod is granted headroom
+// above the guest RAM for qemu overhead, without inflating guest memory.
+//
+// KubeVirt's admission webhook rejects a VMI with no memory requested, so when
+// neither the workspace template nor the Image CR pinned any, the fallback
+// DefaultGuestMemory is applied so the workspace still boots.
+func vmDomainResources(podSpec corev1.PodSpec, img *kubeworkspacesiov1alpha1.Image) map[string]interface{} {
+	resources := map[string]interface{}{}
+	if len(podSpec.Containers) > 0 {
+		if req := podSpec.Containers[0].Resources.Requests; len(req) > 0 {
+			requests := map[string]interface{}{}
+			for k, v := range req {
+				requests[k.String()] = v.String()
+			}
+			resources["requests"] = requests
+		}
+		if lim := podSpec.Containers[0].Resources.Limits; len(lim) > 0 {
+			limits := map[string]interface{}{}
+			for k, v := range lim {
+				limits[k.String()] = v.String()
+			}
+			resources["limits"] = limits
+		}
+	}
+	if img != nil && img.Spec.MemoryLimit != "" {
+		limits, _, _ := unstructured.NestedMap(resources, "limits")
+		if limits == nil {
+			limits = map[string]interface{}{}
+		}
+		reqMap, _, _ := unstructured.NestedMap(resources, "requests")
+		if reqMap == nil {
+			reqMap = map[string]interface{}{}
+		}
+		podMem := img.Spec.MemoryLimit
+		if img.Spec.MemoryRequest != "" {
+			podMem = img.Spec.MemoryRequest
+		}
+		limits["memory"] = podMem
+		resources["limits"] = limits
+		reqMap["memory"] = podMem
+		resources["requests"] = reqMap
+	}
+
+	if _, ok := resources["limits"].(map[string]interface{})["memory"]; !ok {
+		limits, _, _ := unstructured.NestedMap(resources, "limits")
+		if limits == nil {
+			limits = map[string]interface{}{}
+		}
+		limits["memory"] = DefaultGuestMemory
+		resources["limits"] = limits
+	}
+	if _, ok := resources["requests"].(map[string]interface{})["memory"]; !ok {
+		reqMap, _, _ := unstructured.NestedMap(resources, "requests")
+		if reqMap == nil {
+			reqMap = map[string]interface{}{}
+		}
+		reqMap["memory"] = DefaultGuestMemory
+		resources["requests"] = reqMap
+	}
+	return resources
+}
+
 // imageByRef finds the Image CR whose spec.image matches the given reference,
 // or nil when no image matches (in which case cloud-init seeding is skipped).
-func imageByRef(ctx context.Context, reader client.Reader, namespace, imageRef string) (*kubeworkspacesiov1alpha1.Image, error) {
+// Image CRs are cluster-scoped, so no namespace filter is applied.
+func imageByRef(ctx context.Context, reader client.Reader, imageRef string) (*kubeworkspacesiov1alpha1.Image, error) {
 	images := &kubeworkspacesiov1alpha1.ImageList{}
 	if err := reader.List(ctx, images); err != nil {
 		return nil, err
@@ -1668,17 +1677,45 @@ func (r *WorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Service{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(mapPodToRequest))
 
-	// Watch KubeVirt types
+	// Watch KubeVirt types only when their CRDs exist. The deployment-test
+	// cluster runs without KubeVirt, and controller-runtime otherwise polls
+	// forever resolving the missing GVK on startup, blocking the Workspace
+	// reconciler from ever starting.
 	vm := &unstructured.Unstructured{}
 	vm.SetGroupVersionKind(kubeVirtVirtualMachineGVK)
 	vmi := &unstructured.Unstructured{}
 	vmi.SetGroupVersionKind(kubeVirtVirtualMachineInstanceGVK)
 
-	builder = builder.
-		Watches(vm, handler.EnqueueRequestsFromMapFunc(mapVMToRequest)).
-		Watches(vmi, handler.EnqueueRequestsFromMapFunc(mapVMIToRequest))
+	vmInstalled, err := kubeVirtGVKInstalled(mgr.GetRESTMapper(), kubeVirtVirtualMachineGVK)
+	if err != nil {
+		return err
+	}
+	if vmInstalled {
+		builder = builder.Watches(vm, handler.EnqueueRequestsFromMapFunc(mapVMToRequest))
+	}
+	vmiInstalled, err := kubeVirtGVKInstalled(mgr.GetRESTMapper(), kubeVirtVirtualMachineInstanceGVK)
+	if err != nil {
+		return err
+	}
+	if vmiInstalled {
+		builder = builder.Watches(vmi, handler.EnqueueRequestsFromMapFunc(mapVMIToRequest))
+	}
 
 	return builder.
 		Named("workspace").
 		Complete(r)
+}
+
+// kubeVirtGVKInstalled reports whether the KubeVirt API serving the given GVK
+// exists in the cluster. It uses the REST mapper so the check works even when
+// no KubeVirt CRD is present (e.g. the deployment-test cluster).
+func kubeVirtGVKInstalled(mapper meta.RESTMapper, gvk schema.GroupVersionKind) (bool, error) {
+	_, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+	if err == nil {
+		return true, nil
+	}
+	if meta.IsNoMatchError(err) {
+		return false, nil
+	}
+	return false, err
 }
