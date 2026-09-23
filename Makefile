@@ -92,10 +92,12 @@ cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
+	@test -s "$(GOLANGCI_LINT)" && test -x "$(GOLANGCI_LINT)" || { echo "golangci-lint cache corrupt - re-downloading..."; rm -f "$(GOLANGCI_LINT)" "$(GOLANGCI_LINT)-$(GOLANGCI_LINT_VERSION)"; $(MAKE) golangci-lint; }
 	$(GOLANGCI_LINT) run
 
 .PHONY: lint-fix
 lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
+	@test -s "$(GOLANGCI_LINT)" && test -x "$(GOLANGCI_LINT)" || { echo "golangci-lint cache corrupt - re-downloading..."; rm -f "$(GOLANGCI_LINT)" "$(GOLANGCI_LINT)-$(GOLANGCI_LINT_VERSION)"; $(MAKE) golangci-lint; }
 	$(GOLANGCI_LINT) run --fix
 
 .PHONY: lint-config
@@ -225,8 +227,12 @@ $(GOLANGCI_LINT): $(LOCALBIN)
 # $1 - target path with name of binary
 # $2 - package url which can be installed
 # $3 - specific version of package
+# NOTE: the cached copy must be non-empty and executable (-s/-x, not just -f):
+# a 0-byte stub (e.g. from an interrupted download) used to satisfy the check
+# and made `make lint` silently pass by executing an empty file as a no-op
+# shell script. A corrupt cache now triggers a fresh download instead.
 define go-install-tool
-@[ -f "$(1)-$(3)" ] || { \
+@[ -s "$(1)-$(3)" ] && [ -x "$(1)-$(3)" ] || { \
 set -e; \
 package=$(2)@$(3) ;\
 echo "Downloading $${package}" ;\
