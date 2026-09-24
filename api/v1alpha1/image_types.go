@@ -265,6 +265,13 @@ type ImageProxyConfig struct {
 	// requests matching /audio/ to this port instead of the default workspace port.
 	// +optional
 	AudioPort int32 `json:"audioPort,omitempty"`
+	// Port: the workspace Service port the proxy targets instead of the default
+	// 80. The workspace Service maps the first container port to Service port 80
+	// and exposes additional container ports on their own port numbers; images
+	// whose primary proxied traffic should ride a different Service port can set
+	// this to point the proxy there. 0 (unset) keeps the proxy on port 80.
+	// +optional
+	Port int32 `json:"port,omitempty"`
 }
 
 // ImageStatus defines the observed state of Image.
