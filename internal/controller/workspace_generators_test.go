@@ -559,6 +559,54 @@ func TestPreserveLegacyRootDisk(t *testing.T) {
 	}
 }
 
+func TestVirtualMachineNeedsUpdateWithAdmissionDefaults(t *testing.T) {
+	ws := testWorkspace(WorkspaceTypeVM, nil)
+	img := &kubeworkspacesiov1alpha1.Image{Spec: kubeworkspacesiov1alpha1.ImageSpec{PersistentRootDisk: true}}
+	desired := generateVirtualMachine(ws, img, nil)
+	current := desired.DeepCopy()
+	_ = unstructured.SetNestedField(current.Object, "amd64", "spec", "template", "spec", "architecture")
+	_ = unstructured.SetNestedField(current.Object, "q35", "spec", "template", "spec", "domain", "machine", "type")
+	_ = unstructured.SetNestedField(current.Object, "generated-uuid", "spec", "template", "spec", "domain", "firmware", "uuid")
+	unstructured.RemoveNestedField(current.Object, "spec", "template", "spec", "domain", "devices", "gpus")
+	if virtualMachineNeedsUpdate(desired, current) {
+		t.Fatal("admission defaults must not cause perpetual updates")
+	}
+	for _, change := range []struct {
+		name string
+		edit func(*unstructured.Unstructured)
+	}{
+		{"stop", func(vm *unstructured.Unstructured) {
+			_ = unstructured.SetNestedField(vm.Object, false, "spec", "running")
+		}},
+		{"disk reference", func(vm *unstructured.Unstructured) {
+			volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
+			volumes[0].(map[string]interface{})["dataVolume"] = map[string]interface{}{"name": testLegacyRootDiskName}
+			_ = unstructured.SetNestedSlice(vm.Object, volumes, "spec", "template", "spec", "volumes")
+		}},
+		{"extra volume", func(vm *unstructured.Unstructured) {
+			volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
+			volumes = append(volumes, map[string]interface{}{"name": "obsolete-cloudinit"})
+			_ = unstructured.SetNestedSlice(vm.Object, volumes, "spec", "template", "spec", "volumes")
+		}},
+		{"remove GPU", func(vm *unstructured.Unstructured) {
+			_ = unstructured.SetNestedSlice(vm.Object, []interface{}{map[string]interface{}{"name": "gpu0", "deviceName": testNvidiaGPUResource}}, "spec", "template", "spec", "domain", "devices", "gpus")
+		}},
+		{"import source", func(vm *unstructured.Unstructured) {
+			templates, _, _ := unstructured.NestedSlice(vm.Object, "spec", "dataVolumeTemplates")
+			_ = unstructured.SetNestedField(templates[0].(map[string]interface{}), "docker://different-image", "spec", "source", "registry", "url")
+			_ = unstructured.SetNestedSlice(vm.Object, templates, "spec", "dataVolumeTemplates")
+		}},
+	} {
+		t.Run(change.name, func(t *testing.T) {
+			changed := current.DeepCopy()
+			change.edit(changed)
+			if !virtualMachineNeedsUpdate(desired, changed) {
+				t.Fatal("controller-managed change must reconcile")
+			}
+		})
+	}
+}
+
 func TestGenerateVirtualMachineMemoryOverrideWithoutPersistentRoot(t *testing.T) {
 	ws := testWorkspace(WorkspaceTypeVM, nil)
 	img := &kubeworkspacesiov1alpha1.Image{

@@ -517,7 +517,7 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 	}
 	if !justCreated && virtualMachineNeedsUpdate(desired, found) {
 		log.Info("Updating VirtualMachine", "namespace", desired.GetNamespace(), "name", desired.GetName())
-		return 0, nil, retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			latest := &unstructured.Unstructured{}
 			latest.SetGroupVersionKind(kubeVirtVirtualMachineGVK)
 			if err := r.Get(ctx, types.NamespacedName{Name: desired.GetName(), Namespace: desired.GetNamespace()}, latest); err != nil {
@@ -529,6 +529,9 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 			latest.Object["spec"] = desired.Object["spec"]
 			return r.Update(ctx, latest)
 		})
+		if err != nil {
+			return 0, nil, err
+		}
 	}
 
 	// The launcher pod only exists while the VM is running.
@@ -1226,7 +1229,6 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 	devices := map[string]interface{}{
 		"disks":      disks,
 		"interfaces": interfaces,
-		"gpus":       gpus,
 		"inputs": []interface{}{
 			map[string]interface{}{
 				"type": "tablet",
@@ -1234,6 +1236,9 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 				"name": "tablet",
 			},
 		},
+	}
+	if len(gpus) > 0 {
+		devices["gpus"] = gpus
 	}
 	// When the image opts into a specific KubeVirt video device (e.g. "virtio"
 	// for the virtio-gpu paravirtual display), pin domain.devices.video.type.
@@ -1550,7 +1555,9 @@ func runCmdSeeding(user string, sshKeys []string) string {
 		sshDir, sshDir, sshDir, sshDir, blob, sshDir, sshDir)
 }
 
-// virtualMachineNeedsUpdate compares the running flag and the VMI template.
+// virtualMachineNeedsUpdate compares controller-managed fields, allowing
+// KubeVirt's admission defaults (architecture, firmware UUID, machine type,
+// etc.) to remain. Exact template equality creates an endless update loop.
 func virtualMachineNeedsUpdate(desired, current *unstructured.Unstructured) bool {
 	dRunning, _, _ := unstructured.NestedBool(desired.Object, "spec", "running")
 	cRunning, _, _ := unstructured.NestedBool(current.Object, "spec", "running")
@@ -1559,7 +1566,29 @@ func virtualMachineNeedsUpdate(desired, current *unstructured.Unstructured) bool
 	}
 	dT, _, _ := unstructured.NestedMap(desired.Object, "spec", "template")
 	cT, _, _ := unstructured.NestedMap(current.Object, "spec", "template")
-	return !reflect.DeepEqual(dT, cT)
+	if !apiequality.Semantic.DeepDerivative(dT, cT) {
+		return true
+	}
+	// DeepDerivative allows extra slice entries and ignores empty desired
+	// values. These lists are wholly controller-owned: removals must also
+	// reconcile (in particular cloud-init volumes and GPU passthrough).
+	for _, path := range [][]string{
+		{"spec", "template", "spec", "volumes"},
+		{"spec", "template", "spec", "networks"},
+		{"spec", "template", "spec", "tolerations"},
+		{"spec", "template", "spec", "domain", "devices", "disks"},
+		{"spec", "template", "spec", "domain", "devices", "interfaces"},
+		{"spec", "template", "spec", "domain", "devices", "inputs"},
+		{"spec", "template", "spec", "domain", "devices", "gpus"},
+		{"spec", "dataVolumeTemplates"},
+	} {
+		d, _, _ := unstructured.NestedSlice(desired.Object, path...)
+		c, _, _ := unstructured.NestedSlice(current.Object, path...)
+		if len(d) != len(c) || !apiequality.Semantic.DeepDerivative(d, c) {
+			return true
+		}
+	}
+	return false
 }
 
 // deploymentNeedsUpdate compares replicas, containers, init containers, volumes.
