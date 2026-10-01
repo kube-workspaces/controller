@@ -43,6 +43,7 @@ make run         # run controller locally
 - User controller reconciles: personal namespace creation, RoleBindings, ResourceQuotas.
 - Image defaults (`defaultEnv`, `defaultArgs`, `defaultUID`, `defaultInitContainers`, `additionalPorts`) are applied at workspace creation time only.
 - Image fields relevant to `vm` workspaces: `workspaceTypes`, `defaultUser`/`defaultPassword`/`defaultCloudInit`/`defaultUserData`, `persistentRootDisk`/`persistentRootDiskSize`, `memoryLimit`/`memoryRequest`, and `videoDevice` (e.g. `virtio` for the virtio-gpu paravirtual display).
+- Persistent VM DataVolumes/PVCs use `{workspace-name}-rootdisk` (long names are shortened with a hash). For migrations only, an existing **VirtualMachine** can carry `kubeworkspaces.io/legacy-root-disk: "true"` to retain its existing `rootdisk` reference. Ensure that disk has a single VM consumer and its DataVolume owner reference points to that VM before migrating the other consumers. This annotation belongs on the VM, not the Workspace, so clones receive isolated disks.
 - SshKey CRs: the controller injects a workspace owner's SshKey pubkeys into the VM's cloud-init user-data (read via `APIReader`; applies at the guest's next (re)start).
 
 ## CI

@@ -31,6 +31,7 @@ import (
 )
 
 const testWorkspaceName = "my-ws"
+const testLegacyRootDiskName = "rootdisk"
 
 // testCloudConfig is a minimal cloud-config used across the user-data tests.
 const testCloudConfig = "#cloud-config\ncustom: true\n"
@@ -480,8 +481,8 @@ func TestGenerateVirtualMachinePersistentRootDisk(t *testing.T) {
 		t.Error("root disk must not be a containerDisk when persistentRootDisk is set")
 	}
 	dv, ok := root["dataVolume"].(map[string]interface{})
-	if !ok || dv["name"] != "rootdisk" {
-		t.Errorf("root volume should reference the rootdisk DataVolume, got %v", root)
+	if !ok || dv["name"] != ws.Name+"-rootdisk" {
+		t.Errorf("root volume should reference the workspace's DataVolume, got %v", root)
 	}
 
 	// dataVolumeTemplates carries the registry import and PVC sizing.
@@ -490,7 +491,7 @@ func TestGenerateVirtualMachinePersistentRootDisk(t *testing.T) {
 		t.Fatalf("expected 1 dataVolumeTemplate, got %d", len(templates))
 	}
 	tmpl := templates[0].(map[string]interface{})
-	if tmpl["metadata"].(map[string]interface{})["name"] != "rootdisk" {
+	if tmpl["metadata"].(map[string]interface{})["name"] != ws.Name+"-rootdisk" {
 		t.Fatalf("unexpected dataVolumeTemplate metadata: %v", tmpl["metadata"])
 	}
 	url, _, _ := unstructured.NestedString(tmpl, "spec", "source", "registry", "url")
@@ -510,6 +511,51 @@ func TestGenerateVirtualMachinePersistentRootDisk(t *testing.T) {
 	reqs, _, _ := unstructured.NestedStringMap(vm.Object, "spec", "template", "spec", "domain", "resources", "requests")
 	if reqs["memory"] != testMemoryLimit {
 		t.Errorf("expected memory request 4Gi, got %v", reqs)
+	}
+}
+
+func TestPersistentRootDisksAreIsolated(t *testing.T) {
+	img := &kubeworkspacesiov1alpha1.Image{Spec: kubeworkspacesiov1alpha1.ImageSpec{PersistentRootDisk: true}}
+	seen := map[string]bool{}
+	for _, name := range []string{"desktop", "desktop-clone", strings.Repeat("a", 252) + "b", strings.Repeat("a", 252) + "c"} {
+		ws := testWorkspace(WorkspaceTypeVM, nil)
+		ws.Name = name
+		vm := generateVirtualMachine(ws, img, nil)
+		templates, _, _ := unstructured.NestedSlice(vm.Object, "spec", "dataVolumeTemplates")
+		diskName := templates[0].(map[string]interface{})["metadata"].(map[string]interface{})["name"].(string)
+		if len(diskName) > 253 || seen[diskName] {
+			t.Fatalf("invalid or shared disk name %q", diskName)
+		}
+		seen[diskName] = true
+		volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
+		ref, _, _ := unstructured.NestedString(volumes[0].(map[string]interface{}), "dataVolume", "name")
+		if ref != diskName {
+			t.Fatalf("disk reference %q does not match template %q", ref, diskName)
+		}
+	}
+}
+
+func TestPreserveLegacyRootDisk(t *testing.T) {
+	ws := testWorkspace(WorkspaceTypeVM, nil)
+	img := &kubeworkspacesiov1alpha1.Image{Spec: kubeworkspacesiov1alpha1.ImageSpec{PersistentRootDisk: true}}
+	current := generateVirtualMachine(ws, img, nil)
+	volumes, _, _ := unstructured.NestedSlice(current.Object, "spec", "template", "spec", "volumes")
+	volumes[0].(map[string]interface{})["dataVolume"] = map[string]interface{}{"name": testLegacyRootDiskName}
+	_ = unstructured.SetNestedSlice(current.Object, volumes, "spec", "template", "spec", "volumes")
+	for _, preserve := range []bool{false, true} {
+		current.SetAnnotations(map[string]string{AnnotationLegacyRootDisk: strconv.FormatBool(preserve)})
+		desired := generateVirtualMachine(ws, img, nil)
+		preserveLegacyRootDisk(desired, current)
+		want := ws.Name + "-rootdisk"
+		if preserve {
+			want = testLegacyRootDiskName
+		}
+		volumes, _, _ := unstructured.NestedSlice(desired.Object, "spec", "template", "spec", "volumes")
+		ref, _, _ := unstructured.NestedString(volumes[0].(map[string]interface{}), "dataVolume", "name")
+		templates, _, _ := unstructured.NestedSlice(desired.Object, "spec", "dataVolumeTemplates")
+		if ref != want || templates[0].(map[string]interface{})["metadata"].(map[string]interface{})["name"] != want {
+			t.Fatalf("preserve=%v: volume and template must reference %q", preserve, want)
+		}
 	}
 }
 

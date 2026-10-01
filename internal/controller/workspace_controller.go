@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
 	"hash/fnv"
@@ -67,6 +68,10 @@ const (
 	// the workspace from its image, giving it a fresh root volume). The API
 	// stamps it with a timestamp so every reset is unique.
 	AnnotationReset = "kubeworkspaces.io/reset"
+	// AnnotationLegacyRootDisk is set on an existing VM during migration to
+	// retain its legacy rootdisk DataVolume. It is deliberately VM-local so
+	// cloning a Workspace cannot copy the disk-sharing exception.
+	AnnotationLegacyRootDisk = "kubeworkspaces.io/legacy-root-disk"
 	// LabelWorkspaceName is the label applied to pods to identify the workspace
 	LabelWorkspaceName = "workspace-name"
 	// LabelKubevirtVM is set by KubeVirt on virt-launcher pods, naming the VMI
@@ -507,6 +512,9 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 		return 0, nil, err
 	}
 
+	if !justCreated {
+		preserveLegacyRootDisk(desired, found)
+	}
 	if !justCreated && virtualMachineNeedsUpdate(desired, found) {
 		log.Info("Updating VirtualMachine", "namespace", desired.GetNamespace(), "name", desired.GetName())
 		return 0, nil, retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -1066,6 +1074,43 @@ func applyDomainMemoryAndCPU(vmSpec, resources map[string]interface{}, img *kube
 	_ = unstructured.SetNestedField(vmSpec["template"].(map[string]interface{})["spec"].(map[string]interface{}), domain, "domain")
 }
 
+// rootDiskDataVolumeName identifies a namespace-scoped disk per workspace.
+// Keep long workspace names within the DNS-subdomain name limit.
+func rootDiskDataVolumeName(name string) string {
+	if len(name) <= 244 {
+		return name + "-rootdisk"
+	}
+	hash := sha256.Sum256([]byte(name))
+	return fmt.Sprintf("%s-%x-rootdisk", strings.TrimRight(name[:227], ".-"), hash[:8])
+}
+
+// preserveLegacyRootDisk retains a disk explicitly selected during migration.
+// Only the legacy rootdisk reference is eligible; new VMs always get isolated
+// disks. The operator must first ensure no other VM uses the legacy disk.
+func preserveLegacyRootDisk(desired, current *unstructured.Unstructured) {
+	if current.GetAnnotations()[AnnotationLegacyRootDisk] != "true" {
+		return
+	}
+	currentVolumes, _, _ := unstructured.NestedSlice(current.Object, "spec", "template", "spec", "volumes")
+	for _, volume := range currentVolumes {
+		v := volume.(map[string]interface{})
+		name, _, _ := unstructured.NestedString(v, "dataVolume", "name")
+		if v["name"] != "rootdisk" || name != "rootdisk" {
+			continue
+		}
+		templates, _, _ := unstructured.NestedSlice(desired.Object, "spec", "dataVolumeTemplates")
+		if len(templates) != 1 {
+			return
+		}
+		templates[0].(map[string]interface{})["metadata"] = map[string]interface{}{"name": "rootdisk"}
+		_ = unstructured.SetNestedSlice(desired.Object, templates, "spec", "dataVolumeTemplates")
+		volumes, _, _ := unstructured.NestedSlice(desired.Object, "spec", "template", "spec", "volumes")
+		volumes[0].(map[string]interface{})["dataVolume"] = map[string]interface{}{"name": "rootdisk"}
+		_ = unstructured.SetNestedSlice(desired.Object, volumes, "spec", "template", "spec", "volumes")
+		return
+	}
+}
+
 // containerDisk roots are ephemeral, so cloud-init runs on every start.
 func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *kubeworkspacesiov1alpha1.Image, sshKeys []string) *unstructured.Unstructured {
 	stopped := false
@@ -1131,12 +1176,13 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 	}
 	volumes := []interface{}{}
 	if persistentRoot {
+		diskName := rootDiskDataVolumeName(instance.Name)
 		size := img.Spec.PersistentRootDiskSize
 		if size == "" {
 			size = "10Gi"
 		}
 		dataVolumeTemplates = append(dataVolumeTemplates, map[string]interface{}{
-			"metadata": map[string]interface{}{"name": "rootdisk"},
+			"metadata": map[string]interface{}{"name": diskName},
 			"spec": map[string]interface{}{
 				"source": map[string]interface{}{
 					"registry": map[string]interface{}{"url": "docker://" + image},
@@ -1151,7 +1197,7 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 		})
 		volumes = append(volumes, map[string]interface{}{
 			"name":       "rootdisk",
-			"dataVolume": map[string]interface{}{"name": "rootdisk"},
+			"dataVolume": map[string]interface{}{"name": diskName},
 		})
 	} else {
 		volumes = append(volumes, map[string]interface{}{
