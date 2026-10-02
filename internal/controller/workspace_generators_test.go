@@ -17,7 +17,6 @@ limitations under the License.
 package controller
 
 import (
-	"encoding/base64"
 	"strconv"
 	"strings"
 	"testing"
@@ -31,6 +30,7 @@ import (
 )
 
 const testWorkspaceName = "my-ws"
+const testGuestUser = "debian"
 const testLegacyRootDiskName = "rootdisk"
 
 // testCloudConfig is a minimal cloud-config used across the user-data tests.
@@ -680,7 +680,7 @@ func TestCloudInitUserData(t *testing.T) {
 
 	image.Spec.DefaultCloudInit = true
 	image.Spec.DefaultUser = RootUser
-	image.Spec.DefaultPassword = "debian"
+	image.Spec.DefaultPassword = testGuestUser
 	if ud := cloudInitUserData(image, nil); ud == "" {
 		t.Error("expected generated user-data when cloud-init defaults are set")
 	} else if !strings.Contains(ud, "list: |\n    root:debian") {
@@ -704,72 +704,64 @@ func TestInjectSSHAuthorizedKeys(t *testing.T) {
 	const k1 = "ssh-ed25519 AAAAZm9vYmFy user1@host"
 	const k2 = "ssh-rsa AAAAcmNkc2E= user2@host"
 
-	if ud := injectSSHAuthorizedKeys("", nil, ""); ud != "" {
+	if ud := injectSSHAuthorizedKeys("", nil); ud != "" {
 		t.Errorf("no keys => unchanged, got %q", ud)
 	}
-	if ud := injectSSHAuthorizedKeys(testCloudConfig, nil, ""); ud != testCloudConfig {
+	if ud := injectSSHAuthorizedKeys(testCloudConfig, nil); ud != testCloudConfig {
 		t.Errorf("no keys => unchanged existing data, got %q", ud)
 	}
 
 	// Keys only, no existing data: emit a minimal cloud-config.
-	ud := injectSSHAuthorizedKeys("", []string{k1}, "")
+	ud := injectSSHAuthorizedKeys("", []string{k1})
 	if !strings.Contains(ud, "#cloud-config") || !strings.Contains(ud, "ssh_authorized_keys") || !strings.Contains(ud, k1) {
 		t.Errorf("expected minimal cloud-config with key, got %q", ud)
 	}
 	if strings.Contains(ud, "runcmd") {
-		t.Errorf("no default user => no runcmd re-seeding, got %q", ud)
+		t.Errorf("first-boot seeding must not add runcmd, got %q", ud)
 	}
 
-	// Merge into existing generated user-data (password config preserved) and
-	// emit a reboot-safe runcmd entry carrying base64-encoded keys.
+	// Merge into existing generated user-data, preserving password config.
 	image := &kubeworkspacesiov1alpha1.Image{}
 	image.Spec.DefaultCloudInit = true
-	image.Spec.DefaultUser = "debian"
+	image.Spec.DefaultUser = testGuestUser
 	image.Spec.DefaultPassword = "secret"
 	full := cloudInitUserData(image, []string{k1, k2})
-	wantBlob := base64.StdEncoding.EncodeToString([]byte(k1 + "\n" + k2))
-	for _, want := range []string{"#cloud-config", "debian:secret", "ssh_authorized_keys", k1, k2, "runcmd", wantBlob, "/home/debian/.ssh/authorized_keys"} {
+	for _, want := range []string{"#cloud-config", "debian:secret", "ssh_authorized_keys", k1, k2} {
 		if !strings.Contains(full, want) {
 			t.Errorf("expected user-data to contain %q, got %q", want, full)
 		}
 	}
-	if strings.Count(full, wantBlob) != 1 {
-		t.Errorf("expected a single runcmd entry, got %q", full)
-	}
-
-	// Seed for the root account targets /root/.ssh.
-	root := injectSSHAuthorizedKeys("", []string{k1}, RootUser)
-	if !strings.Contains(root, "/root/.ssh/authorized_keys") {
-		t.Errorf("expected root account key seeding, got %q", root)
+	if strings.Contains(full, "runcmd") {
+		t.Errorf("first-boot seeding must not add runcmd, got %q", full)
 	}
 
 	// Merge into explicit DefaultUserData (the baked debian-gnome case).
-	baked := "#cloud-config\nssh_pwauth: true\npackages:\n  - htop\n"
-	merged := injectSSHAuthorizedKeys(baked, []string{k1, k1}, "debian")
+	baked := "#cloud-config\nssh_pwauth: true\npackages:\n  - htop\nruncmd:\n  - echo preserved\n"
+	merged := injectSSHAuthorizedKeys(baked, []string{k1, k1})
 	if !strings.Contains(merged, "ssh_authorized_keys") || !strings.Contains(merged, k1) {
 		t.Errorf("expected keys merged into baked user-data, got %q", merged)
 	}
-	if !strings.Contains(merged, "runcmd") || !strings.Contains(merged, "/home/debian/.ssh/authorized_keys") {
-		t.Errorf("expected runcmd re-seeding in baked user-data, got %q", merged)
+	if !strings.Contains(merged, "echo preserved") {
+		t.Errorf("expected image runcmd preserved, got %q", merged)
 	}
 	if !strings.Contains(merged, "htop") {
 		t.Errorf("expected packages list preserved in merged user-data, got %q", merged)
 	}
 
-	// Re-injecting the same key set is a no-op (runcmd and keys deduplicated).
-	again := injectSSHAuthorizedKeys(merged, []string{k1}, "debian")
+	// Re-injecting the same key set is a no-op.
+	again := injectSSHAuthorizedKeys(merged, []string{k1})
 	if again != merged {
 		t.Errorf("expected idempotent re-injection, got %q", again)
 	}
 
 	// Dedupe: k1 twice yields one entry.
-	dedup := injectSSHAuthorizedKeys("", []string{k1, k1}, "")
+	dedup := injectSSHAuthorizedKeys("", []string{k1, k1})
 	if strings.Count(dedup, k1) != 1 {
 		t.Errorf("expected deduplicated keys, got %q", dedup)
 	}
 
 	// Invalid existing YAML is left alone rather than corrupted.
-	broken := injectSSHAuthorizedKeys("#cloud-config\n: :\n  -", []string{k1}, "debian")
+	broken := injectSSHAuthorizedKeys("#cloud-config\n: :\n  -", []string{k1})
 	if !strings.Contains(broken, ": :") {
 		t.Errorf("expected invalid user-data left as-is, got %q", broken)
 	}

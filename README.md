@@ -82,6 +82,15 @@ The reconciler switches on `spec.type`:
 5. Update workspace status from pod/VMI state
 6. Ensure default container port if not specified (default: 8080)
 
+`SshKey` create/update/delete events reconcile all VMs in the same namespace.
+Images with `kubeworkspaces.io/ssh-key-propagation: qemuGuestAgent` in metadata
+annotations and a `defaultUser` use a Workspace-owned SSH-key Secret and native
+KubeVirt guest-agent propagation. This manages the user's whole
+`authorized_keys` file, including revocation; the image must install and start
+`qemu-guest-agent`. Existing VMs need one restart to attach the Secret, then key
+changes apply live without VM-template changes. No restart is forced. Other
+images use first-boot cloud-init seeding (`runcmd` is not a per-boot module).
+
 ## Development
 
 ```bash

@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"fmt"
 	"hash/fnv"
 	"reflect"
@@ -72,6 +71,9 @@ const (
 	// retain its legacy rootdisk DataVolume. It is deliberately VM-local so
 	// cloning a Workspace cannot copy the disk-sharing exception.
 	AnnotationLegacyRootDisk = "kubeworkspaces.io/legacy-root-disk"
+	// AnnotationSSHKeyPropagation opts an Image into platform-owned guest keys.
+	// The image must install and run qemu-guest-agent with SSH-key support.
+	AnnotationSSHKeyPropagation = "kubeworkspaces.io/ssh-key-propagation"
 	// LabelWorkspaceName is the label applied to pods to identify the workspace
 	LabelWorkspaceName = "workspace-name"
 	// LabelKubevirtVM is set by KubeVirt on virt-launcher pods, naming the VMI
@@ -196,6 +198,7 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	case WorkspaceTypeVM:
 		rr, p, err := r.reconcileVirtualMachine(ctx, instance)
 		if err != nil {
+			r.setCondition(ctx, instance, "Ready", "False", "VMReconcileFailed", err.Error())
 			ReconcileTotal.WithLabelValues("error").Inc()
 			ReconcileDuration.Observe(time.Since(reconcileStart).Seconds())
 			return ctrl.Result{}, err
@@ -326,6 +329,9 @@ func (r *WorkspaceReconciler) setCondition(ctx context.Context, ws *kubeworkspac
 
 	var conditions []kubeworkspacesiov1alpha1.WorkspaceCondition
 	for _, c := range ws.Status.Conditions {
+		if c.Type == condType && c.Status == status && c.Reason == reason && c.Message == message {
+			return
+		}
 		if c.Type != condType {
 			conditions = append(conditions, c)
 		}
@@ -470,21 +476,33 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 		log.Info("Found Image CR", "name", img.Name, "image", img.Spec.Image, "memoryLimit", img.Spec.MemoryLimit)
 	}
 
-	// Seed the workspace owner's SSH public keys into the guest cloud-init so
-	// their sshd trusts them (passwordless SSH into vm workspaces). Keys live
-	// as SshKey CRs in the workspace's (personal) namespace. Changes to keys
-	// change the generated user-data, which on a running VM takes effect at the
-	// next (re)start.
+	// Keys live in the workspace's personal namespace. Images opting in
+	// with a declared user use native guest-agent credential propagation;
+	// other images retain first-boot cloud-init seeding.
 	sshKeys, err := sshAuthorizedKeysForWorkspace(ctx, r.Client, instance.Namespace)
 	if err != nil {
 		log.Error(err, "unable to look up SshKey CRs for cloud-init seeding")
 		return 0, nil, err
 	}
+	if usesGuestAgentSSH(img) {
+		if err := r.reconcileSSHKeySecret(ctx, instance, sshKeys); err != nil {
+			return 0, nil, err
+		}
+		// Do not bake managed keys into persistent cloud-init data: otherwise a
+		// reboot could reintroduce a revoked key before the agent synchronizes.
+		sshKeys = nil
+	}
 
 	// Large user-data is served from a Secret generated below. Reconcile it
 	// before building the VM so the referent exists (ideally) before the
 	// VirtualMachine that references it.
-	cloudUserData := cloudInitUserData(img, sshKeys)
+	cloudUserData, err := vmCloudInitUserData(instance, img, sshKeys)
+	if err != nil {
+		return 0, nil, err
+	}
+	if err := r.claimVMDisks(ctx, instance); err != nil {
+		return 0, nil, err
+	}
 	if err := r.reconcileCloudInitSecret(ctx, instance, cloudUserData); err != nil {
 		log.Error(err, "unable to reconcile cloud-init Secret")
 		return 0, nil, err
@@ -603,6 +621,33 @@ func (r *WorkspaceReconciler) reconcileCloudInitSecret(ctx context.Context, inst
 		return r.Update(ctx, found)
 	}
 	return nil
+}
+
+func usesGuestAgentSSH(img *kubeworkspacesiov1alpha1.Image) bool {
+	return img != nil && img.Spec.DefaultUser != "" && img.Annotations[AnnotationSSHKeyPropagation] == "qemuGuestAgent"
+}
+
+func sshKeySecretName(workspaceName string) string {
+	// Kubernetes Secret names have the same maximum length as DataVolume names.
+	return strings.TrimSuffix(rootDiskDataVolumeName(workspaceName), "-rootdisk") + "-sshkeys"
+}
+
+// reconcileSSHKeySecret maintains a stable credential source even when no
+// keys exist, so adding the first or deleting the last key works without a
+// restart. KubeVirt owns delivery and authorized_keys replacement in the guest.
+func (r *WorkspaceReconciler) reconcileSSHKeySecret(ctx context.Context, instance *kubeworkspacesiov1alpha1.Workspace, sshKeys []string) error {
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: sshKeySecretName(instance.Name), Namespace: instance.Namespace,
+	}}
+	_, err := ctrl.CreateOrUpdate(ctx, r.Client, secret, func() error {
+		if err := ctrl.SetControllerReference(instance, secret, r.Scheme); err != nil {
+			return err
+		}
+		secret.Type = corev1.SecretTypeOpaque
+		secret.Data = map[string][]byte{"authorized_keys": []byte(strings.Join(sshKeys, "\n"))}
+		return nil
+	})
+	return err
 }
 
 // handleReset re-provisions a vm workspace when a reset has been requested.
@@ -1208,13 +1253,25 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 			"containerDisk": map[string]interface{}{"image": image},
 		})
 	}
-	cloudUserData := cloudInitUserData(img, sshKeys)
+	if usesGuestAgentSSH(img) {
+		sshKeys = nil
+	}
+	cloudUserData, _ := vmCloudInitUserData(instance, img, sshKeys)
 	if cloudUserData != "" {
 		disks = append(disks, map[string]interface{}{
 			"name": "cloudinitdisk",
 			"disk": map[string]interface{}{"bus": "virtio"},
 		})
 		volumes = append(volumes, cloudInitVolume(instance.Name, cloudUserData))
+	}
+	if len(podSpec.Containers) > 0 {
+		for _, mount := range podSpec.Containers[0].VolumeMounts {
+			name := "data-" + vmDiskSerial(mount.Name)
+			disks = append(disks, map[string]interface{}{"name": name, "serial": vmDiskSerial(mount.Name),
+				"disk": map[string]interface{}{"bus": "virtio"}})
+			volumes = append(volumes, map[string]interface{}{"name": name,
+				"dataVolume": map[string]interface{}{"name": mount.Name}})
+		}
 	}
 
 	// VMI template labels: workspace-name drives the controller's pod watch;
@@ -1271,6 +1328,18 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 				"volumes":  volumes,
 			},
 		},
+	}
+	if usesGuestAgentSSH(img) {
+		_ = unstructured.SetNestedSlice(vmSpec, []interface{}{
+			map[string]interface{}{"sshPublicKey": map[string]interface{}{
+				"source": map[string]interface{}{"secret": map[string]interface{}{
+					"secretName": sshKeySecretName(instance.Name),
+				}},
+				"propagationMethod": map[string]interface{}{"qemuGuestAgent": map[string]interface{}{
+					"users": []interface{}{img.Spec.DefaultUser},
+				}},
+			}},
+		}, "template", "spec", "accessCredentials")
 	}
 	// Carry the workspace's scheduling constraints (nodeSelector, tolerations —
 	// including the auto-added GPU toleration) into the VMI template so the
@@ -1397,7 +1466,28 @@ func sshAuthorizedKeysForWorkspace(ctx context.Context, reader client.Reader, na
 			out = append(out, pk)
 		}
 	}
+	sort.Strings(out)
 	return out, nil
+}
+
+// workspacesForSSHKey maps key changes (including deletion) to every VM in
+// the key's namespace. Keys are shared by the personal namespace's workspaces.
+func (r *WorkspaceReconciler) workspacesForSSHKey(ctx context.Context, object client.Object) []reconcile.Request {
+	workspaces := &kubeworkspacesiov1alpha1.WorkspaceList{}
+	if err := r.List(ctx, workspaces, client.InNamespace(object.GetNamespace())); err != nil {
+		logf.FromContext(ctx).Error(err, "unable to list workspaces for SSH key change")
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(workspaces.Items))
+	for i := range workspaces.Items {
+		ws := &workspaces.Items[i]
+		if workspaceTypeOf(ws) == WorkspaceTypeVM {
+			requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{
+				Namespace: ws.Namespace, Name: ws.Name,
+			}})
+		}
+	}
+	return requests
 }
 
 // cloudInitSecretKey is the Secret data key KubeVirt's NoCloud datasource
@@ -1439,14 +1529,12 @@ func cloudInitVolume(workspaceName, cloudUserData string) map[string]interface{}
 // minimal cloud-config is generated that sets the password on the account (the
 // containerDisk root is ephemeral, so this applies on every boot). The
 // workspace owner's SSH public keys are merged into the resulting user-data as
-// cloud-init ssh_authorized_keys so the guest's sshd trusts them, and a
-// runcmd (PER_ALWAYS) entry re-asserts the same keys on every boot so reboots
-// never drop them. Empty user-data means no datasource is attached.
+// cloud-init ssh_authorized_keys for first-boot seeding only. Managed guests
+// pass no keys here; their accessCredentials Secret is authoritative instead.
+// Empty user-data means no datasource is attached.
 func cloudInitUserData(image *kubeworkspacesiov1alpha1.Image, sshKeys []string) string {
 	userData := ""
-	defaultUser := ""
 	if image != nil {
-		defaultUser = image.Spec.DefaultUser
 		if image.Spec.DefaultUserData != "" {
 			userData = image.Spec.DefaultUserData
 		} else if image.Spec.DefaultCloudInit && image.Spec.DefaultUser != "" && image.Spec.DefaultPassword != "" {
@@ -1459,7 +1547,7 @@ func cloudInitUserData(image *kubeworkspacesiov1alpha1.Image, sshKeys []string) 
 				image.Spec.DefaultUser, image.Spec.DefaultPassword)
 		}
 	}
-	return injectSSHAuthorizedKeys(userData, sshKeys, defaultUser)
+	return injectSSHAuthorizedKeys(userData, sshKeys)
 }
 
 // injectSSHAuthorizedKeys merges SSH public keys into a cloud-init user-data
@@ -1470,10 +1558,9 @@ func cloudInitUserData(image *kubeworkspacesiov1alpha1.Image, sshKeys []string) 
 //
 // ssh_authorized_keys is a PER_INSTANCE module: a VMI restart keeps the NoCloud
 // instance-id, so the keys would never be re-applied after the guest's first
-// boot. When defaultUser is non-empty, a runcmd entry (PER_ALWAYS) is also
-// added that idempotently appends each key to that account's authorized_keys
-// file on every boot, making key seeding reboot-safe.
-func injectSSHAuthorizedKeys(userData string, sshKeys []string, defaultUser string) string {
+// boot. runcmd is also PER_INSTANCE, not a reboot-seeding mechanism. Live and
+// reboot synchronization are handled by KubeVirt's guest-agent credentials.
+func injectSSHAuthorizedKeys(userData string, sshKeys []string) string {
 	if len(sshKeys) == 0 {
 		return userData
 	}
@@ -1509,50 +1596,11 @@ func injectSSHAuthorizedKeys(userData string, sshKeys []string, defaultUser stri
 	}
 	body["ssh_authorized_keys"] = merged
 
-	if defaultUser != "" {
-		keyList := make([]string, 0, len(merged))
-		for _, k := range merged {
-			if ks, ok := k.(string); ok {
-				keyList = append(keyList, ks)
-			}
-		}
-		if rcmd := runCmdSeeding(defaultUser, keyList); rcmd != "" {
-			existingRun, _ := body["runcmd"].([]interface{})
-			dup := false
-			for _, e := range existingRun {
-				if s, ok := e.(string); ok && s == rcmd {
-					dup = true
-					break
-				}
-			}
-			if !dup {
-				body["runcmd"] = append(existingRun, rcmd)
-			}
-		}
-	}
-
 	mergedYAML, err := yaml.Marshal(body)
 	if err != nil {
 		return userData
 	}
 	return "#cloud-config\n" + string(mergedYAML)
-}
-
-// runCmdSeeding builds the PER_ALWAYS cloud-init runcmd shell command that
-// idempotently appends every key to the given account's authorized_keys file.
-// Keys travel base64-encoded so shell special characters in key comments
-// cannot break the command. Returns "" when there is nothing to seed.
-func runCmdSeeding(user string, sshKeys []string) string {
-	if len(user) == 0 || len(sshKeys) == 0 {
-		return ""
-	}
-	sshDir := "/home/" + user + "/.ssh"
-	if user == RootUser {
-		sshDir = "/root/.ssh"
-	}
-	blob := base64.StdEncoding.EncodeToString([]byte(strings.Join(sshKeys, "\n")))
-	return fmt.Sprintf("mkdir -p %s && chmod 700 %s && touch %s/authorized_keys && chmod 600 %s/authorized_keys && echo %s | base64 -d | while IFS= read -r line; do grep -qxF \"$line\" %s/authorized_keys || echo \"$line\" >> %s/authorized_keys; done",
-		sshDir, sshDir, sshDir, sshDir, blob, sshDir, sshDir)
 }
 
 // virtualMachineNeedsUpdate compares controller-managed fields, allowing
@@ -1573,6 +1621,7 @@ func virtualMachineNeedsUpdate(desired, current *unstructured.Unstructured) bool
 	// values. These lists are wholly controller-owned: removals must also
 	// reconcile (in particular cloud-init volumes and GPU passthrough).
 	for _, path := range [][]string{
+		{"spec", "template", "spec", "accessCredentials"},
 		{"spec", "template", "spec", "volumes"},
 		{"spec", "template", "spec", "networks"},
 		{"spec", "template", "spec", "tolerations"},
@@ -1750,6 +1799,8 @@ func (r *WorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
+		Owns(&corev1.Secret{}).
+		Watches(&kubeworkspacesiov1alpha1.SshKey{}, handler.EnqueueRequestsFromMapFunc(r.workspacesForSSHKey)).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(mapPodToRequest))
 
 	// Watch KubeVirt types only when their CRDs exist. The deployment-test
