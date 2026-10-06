@@ -124,6 +124,12 @@ type ImageSpec struct {
 	// containing a bootable guest disk.
 	// +optional
 	WorkspaceTypes []string `json:"workspaceTypes,omitempty"`
+	// VMProfile selects a named controller-supported guest contract. Empty keeps
+	// the existing Linux/legacy VM behaviour. Windows roots must be private,
+	// generalised, persistent and pinned by OCI digest.
+	// +kubebuilder:validation:Enum=windows11-amd64-v1
+	// +optional
+	VMProfile string `json:"vmProfile,omitempty"`
 	// PersistentRootDisk indicates the VM root disk should be a DataVolume
 	// backing-persistent PVC imported from the container disk image (via CDI)
 	// rather than an ephemeral containerDisk. Requires a storage class that CDI

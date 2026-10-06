@@ -7,6 +7,17 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - configmaps
+  - nodes
+  - persistentvolumeclaims
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - events
   verbs:
   - create
@@ -32,11 +43,9 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - pods
+  - pods/exec
   verbs:
-  - get
-  - list
-  - watch
+  - create
 - apiGroups:
   - apps
   resources:
@@ -63,8 +72,17 @@ rules:
   - update
   - watch
 - apiGroups:
+  - cdi.kubevirt.io
+  resources:
+  - storageprofiles
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - kubevirt.io
   resources:
+  - kubevirts
   - virtualmachineinstances
   verbs:
   - get
@@ -143,6 +161,14 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - storage.k8s.io
+  resources:
+  - storageclasses
+  verbs:
+  - get
+  - list
   - watch
 - apiGroups:
   - subresources.kubevirt.io

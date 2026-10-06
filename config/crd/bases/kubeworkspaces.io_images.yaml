@@ -1794,6 +1794,14 @@ spec:
                 - cirrus
                 - ramfb
                 type: string
+              vmProfile:
+                description: |-
+                  VMProfile selects a named controller-supported guest contract. Empty keeps
+                  the existing Linux/legacy VM behaviour. Windows roots must be private,
+                  generalised, persistent and pinned by OCI digest.
+                enum:
+                - windows11-amd64-v1
+                type: string
               workspaceTypes:
                 description: |-
                   WorkspaceTypes lists the workspace types this image can be used with

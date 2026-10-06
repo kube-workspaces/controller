@@ -23,7 +23,12 @@ import (
 
 // WorkspaceSpec defines the desired state of Workspace.
 // Modelled closely on Kubeflow Notebook spec - wraps a full PodSpec.
+// +kubebuilder:validation:XValidation:rule="!has(self.vmProfile) || self.type == 'vm'",message="VM guest profiles require type vm"
+// +kubebuilder:validation:XValidation:rule="!has(self.vmProfile) || (size(self.template.spec.containers) == 1 && self.template.spec.containers[0].image == self.vmProfile.image)",message="The main image must match the resolved VM source"
 type WorkspaceSpec struct {
+	// VMProfile is the stable resolved guest/source identity for VM workspaces.
+	// +optional
+	VMProfile *ResolvedVMProfile `json:"vmProfile,omitempty"`
 	// Type selects the workload used to run the workspace.
 	// "container" (default) runs the pod template as a StatefulSet.
 	// "scratch" runs it as a plain Deployment (no persistent identity).

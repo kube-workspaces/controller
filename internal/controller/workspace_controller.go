@@ -112,7 +112,8 @@ type WorkspaceReconciler struct {
 	EventRecorder record.EventRecorder
 	// APIReader bypasses the informer cache for resources the controller does
 	// not watch (e.g. Image CRs read for cloud-init seeding).
-	APIReader client.Reader
+	APIReader  client.Reader
+	GuestAgent WindowsGuestAgent
 }
 
 // +kubebuilder:rbac:groups=kubeworkspaces.io,resources=images,verbs=get;list;watch;create
@@ -121,6 +122,13 @@ type WorkspaceReconciler struct {
 // +kubebuilder:rbac:groups=kubeworkspaces.io,resources=workspaces/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=kubeworkspaces.io,resources=workspaces/finalizers,verbs=update
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=pods/exec,verbs=create
+// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
+// +kubebuilder:rbac:groups=kubevirt.io,resources=kubevirts,verbs=get;list;watch
+// +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=storageprofiles,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=events,verbs=get;list;watch;create;patch
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
@@ -283,6 +291,9 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 	}
 
+	if windowsWorkspace(instance) && !stopped && readyReplicas == 0 {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
 	return ctrl.Result{}, nil
 }
 
@@ -466,7 +477,11 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 		imageRef = instance.Spec.Template.Spec.Containers[0].Image
 	}
 	log.Info("Looking up Image CR", "imageRef", imageRef)
-	img, err := imageByRef(ctx, r.Client, imageRef)
+	var img *kubeworkspacesiov1alpha1.Image
+	var err error
+	if instance.Spec.VMProfile == nil {
+		img, err = imageByRef(ctx, r.Client, imageRef)
+	}
 	if err != nil {
 		log.Error(err, "unable to look up Image CR for cloud-init seeding")
 		return 0, nil, err
@@ -476,36 +491,20 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 	} else {
 		log.Info("Found Image CR", "name", img.Name, "image", img.Spec.Image, "memoryLimit", img.Spec.MemoryLimit)
 	}
-
-	// Keys live in the workspace's personal namespace. Images opting in
-	// with a declared user use native guest-agent credential propagation;
-	// other images retain first-boot cloud-init seeding.
-	sshKeys, err := sshAuthorizedKeysForWorkspace(ctx, r.Client, instance.Namespace)
+	resolved, err := r.resolveWindowsProfile(ctx, instance, img)
 	if err != nil {
-		log.Error(err, "unable to look up SshKey CRs for cloud-init seeding")
 		return 0, nil, err
 	}
-	if usesGuestAgentSSH(img) {
-		if err := r.reconcileSSHKeySecret(ctx, instance, sshKeys); err != nil {
+	if resolved {
+		return 0, nil, nil
+	}
+	if windowsWorkspace(instance) {
+		if err := r.finishWindowsLifecycle(ctx, instance); err != nil {
 			return 0, nil, err
 		}
-		// Do not bake managed keys into persistent cloud-init data: otherwise a
-		// reboot could reintroduce a revoked key before the agent synchronizes.
-		sshKeys = nil
 	}
-
-	// Large user-data is served from a Secret generated below. Reconcile it
-	// before building the VM so the referent exists (ideally) before the
-	// VirtualMachine that references it.
-	cloudUserData, err := vmCloudInitUserData(instance, img, sshKeys)
+	sshKeys, err := r.reconcileVMGuestBootstrap(ctx, instance, img)
 	if err != nil {
-		return 0, nil, err
-	}
-	if err := r.claimVMDisks(ctx, instance); err != nil {
-		return 0, nil, err
-	}
-	if err := r.reconcileCloudInitSecret(ctx, instance, cloudUserData); err != nil {
-		log.Error(err, "unable to reconcile cloud-init Secret")
 		return 0, nil, err
 	}
 
@@ -532,6 +531,9 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 	}
 
 	if !justCreated {
+		if windowsWorkspace(instance) && (!metav1.IsControlledBy(found, instance) || found.GetAnnotations()["kubeworkspaces.io/windows-generation"] != instance.Spec.VMProfile.Generation) {
+			return 0, nil, fmt.Errorf("existing VM identity cannot change without an explicit Reset")
+		}
 		preserveLegacyRootDisk(desired, found)
 	}
 	if !justCreated && virtualMachineNeedsUpdate(desired, found) {
@@ -564,12 +566,58 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 	// readyReplicas=1 because the virt-launcher pod stays in Ready state while
 	// the guest is down.
 	vmiReady := vmiIsRunning(ctx, r.Client, instance)
+	if windowsWorkspace(instance) {
+		vmiReady, err = r.windowsReady(ctx, instance, pod, vmiReady)
+		if err != nil {
+			return 0, pod, err
+		}
+	}
 
 	var readyReplicas int32
 	if pod != nil && podReady(pod) && vmiReady {
 		readyReplicas = 1
 	}
 	return readyReplicas, pod, nil
+}
+
+// Prepare the guest's native bootstrap before its VM can reference the Secret.
+// Windows never enters the Linux cloud-init, SSH-key or ext4 disk contract.
+func (r *WorkspaceReconciler) reconcileVMGuestBootstrap(ctx context.Context, instance *kubeworkspacesiov1alpha1.Workspace, img *kubeworkspacesiov1alpha1.Image) ([]string, error) {
+	if windowsWorkspace(instance) {
+		_, stopped := instance.Annotations[AnnotationStopped]
+		if stopped || instance.Annotations[windowsDetachingGeneration] == instance.Spec.VMProfile.Generation || instance.Annotations[windowsRebootAnnotation] != "" {
+			return nil, validateWindowsProfile(instance)
+		}
+		if err := r.preflightWindows(ctx, instance); err != nil {
+			return nil, err
+		}
+		return nil, r.reconcileWindowsBootstrap(ctx, instance)
+	}
+	log := logf.FromContext(ctx)
+	sshKeys, err := sshAuthorizedKeysForWorkspace(ctx, r.Client, instance.Namespace)
+	if err != nil {
+		log.Error(err, "unable to look up SshKey CRs for cloud-init seeding")
+		return nil, err
+	}
+	if usesGuestAgentSSH(img) {
+		if err := r.reconcileSSHKeySecret(ctx, instance, sshKeys); err != nil {
+			return nil, err
+		}
+		// Persistent cloud-init must not reintroduce keys revoked by the agent.
+		sshKeys = nil
+	}
+	cloudUserData, err := vmCloudInitUserData(instance, img, sshKeys)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.claimVMDisks(ctx, instance); err != nil {
+		return nil, err
+	}
+	if err := r.reconcileCloudInitSecret(ctx, instance, cloudUserData); err != nil {
+		log.Error(err, "unable to reconcile cloud-init Secret")
+		return nil, err
+	}
+	return sshKeys, nil
 }
 
 // reconcileCloudInitSecret backs a VM workspace's cloud-init user-data with a
@@ -669,6 +717,25 @@ func (r *WorkspaceReconciler) handleReset(ctx context.Context, instance *kubewor
 	found.SetGroupVersionKind(kubeVirtVirtualMachineGVK)
 	err := r.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, found)
 	if err == nil {
+		if windowsWorkspace(instance) && found.GetDeletionTimestamp().IsZero() {
+			running, _, _ := unstructured.NestedBool(found.Object, "spec", "running")
+			if running {
+				if err := unstructured.SetNestedField(found.Object, false, "spec", "running"); err != nil {
+					return ctrl.Result{}, true, err
+				}
+				if err := r.Update(ctx, found); err != nil {
+					return ctrl.Result{}, true, err
+				}
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, true, nil
+			}
+			vmi := &unstructured.Unstructured{}
+			vmi.SetGroupVersionKind(kubeVirtVirtualMachineInstanceGVK)
+			if err := r.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, vmi); err == nil {
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, true, nil
+			} else if !apierrs.IsNotFound(err) {
+				return ctrl.Result{}, true, err
+			}
+		}
 		if found.GetDeletionTimestamp().IsZero() {
 			log.Info("Deleting VirtualMachine", "namespace", found.GetNamespace(), "name", found.GetName())
 			// Foreground propagation so the owned root DataVolume/PVC is
@@ -690,6 +757,9 @@ func (r *WorkspaceReconciler) handleReset(ctx context.Context, instance *kubewor
 
 	// The VirtualMachine (and its root volume) are gone; consume the reset
 	// annotation so the next reconcile recreates the workspace fresh.
+	if err := r.resetWindowsGeneration(ctx, instance); err != nil {
+		return ctrl.Result{}, true, err
+	}
 	log.Info("VirtualMachine deleted; clearing reset annotation", "namespace", instance.Namespace, "name", instance.Name)
 	annotations := instance.GetAnnotations()
 	delete(annotations, AnnotationReset)
@@ -829,6 +899,9 @@ func (r *WorkspaceReconciler) updateWorkspaceStatus(ctx context.Context,
 		}
 	}
 
+	if windowsWorkspace(ws) {
+		windowsStatusConditions(ws, &status)
+	}
 	// Only update if status has changed
 	if !reflect.DeepEqual(ws.Status, status) {
 		log.Info("Updating Workspace CR Status")
@@ -1162,6 +1235,9 @@ func preserveLegacyRootDisk(desired, current *unstructured.Unstructured) {
 
 // containerDisk roots are ephemeral, so cloud-init runs on every start.
 func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *kubeworkspacesiov1alpha1.Image, sshKeys []string) *unstructured.Unstructured {
+	if windowsWorkspace(instance) {
+		return generateWindowsVirtualMachine(instance)
+	}
 	stopped := false
 	if _, ok := instance.Annotations[AnnotationStopped]; ok {
 		stopped = true
@@ -1759,6 +1835,13 @@ func serviceNeedsUpdate(desired, current *corev1.Service) bool {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *WorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.GuestAgent == nil {
+		agent, err := newWindowsGuestAgent(mgr.GetConfig())
+		if err != nil {
+			return err
+		}
+		r.GuestAgent = agent
+	}
 	// Map function to convert pod events to reconciliation requests
 	mapPodToRequest := handler.MapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
 		if nbName, ok := object.GetLabels()[LabelWorkspaceName]; ok {
