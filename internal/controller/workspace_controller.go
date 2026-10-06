@@ -508,7 +508,13 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 		return 0, nil, err
 	}
 
-	desired := generateVirtualMachine(instance, img, sshKeys)
+	// Get unstructured instance to extract volume mount metadata (including CD-ROM fields)
+	instUnstructured := &unstructured.Unstructured{}
+	instUnstructured.SetGroupVersionKind(kubeworkspacesiov1alpha1.GroupVersion.WithKind("Workspace"))
+	if err := r.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, instUnstructured); err != nil {
+		return 0, nil, err
+	}
+	desired := generateVirtualMachine(instance, img, sshKeys, instUnstructured)
 	if err := ctrl.SetControllerReference(instance, desired, r.Scheme); err != nil {
 		return 0, nil, err
 	}
@@ -1234,7 +1240,7 @@ func preserveLegacyRootDisk(desired, current *unstructured.Unstructured) {
 }
 
 // containerDisk roots are ephemeral, so cloud-init runs on every start.
-func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *kubeworkspacesiov1alpha1.Image, sshKeys []string) *unstructured.Unstructured {
+func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *kubeworkspacesiov1alpha1.Image, sshKeys []string, instUnstructured ...*unstructured.Unstructured) *unstructured.Unstructured {
 	if windowsWorkspace(instance) {
 		return generateWindowsVirtualMachine(instance)
 	}
@@ -1342,10 +1348,45 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 		volumes = append(volumes, cloudInitVolume(instance.Name, cloudUserData))
 	}
 	if len(podSpec.Containers) > 0 {
+		// Look up volume mount metadata from unstructured instance if available
+		var volumeMountMeta map[string]map[string]interface{}
+		if len(instUnstructured) > 0 && instUnstructured[0] != nil {
+			if containers, _, _ := unstructured.NestedSlice(instUnstructured[0].Object, "spec", "template", "spec", "containers"); len(containers) > 0 {
+				if c, ok := containers[0].(map[string]interface{}); ok {
+					if vms, _, _ := unstructured.NestedSlice(c, "volumeMounts"); len(vms) > 0 {
+						volumeMountMeta = make(map[string]map[string]interface{}, len(vms))
+						for _, vm := range vms {
+							if vmMap, ok := vm.(map[string]interface{}); ok {
+								if name, ok := vmMap["name"].(string); ok {
+									volumeMountMeta[name] = vmMap
+								}
+							}
+						}
+					}
+				}
+			}
+		}
 		for _, mount := range podSpec.Containers[0].VolumeMounts {
 			name := "data-" + vmDiskSerial(mount.Name)
-			disks = append(disks, map[string]interface{}{"name": name, "serial": vmDiskSerial(mount.Name),
-				"disk": map[string]interface{}{"bus": "virtio"}})
+			mountMeta := volumeMountMeta[mount.Name]
+			mountType, _ := mountMeta["type"].(string)
+			if mountType == "cdrom" {
+				bus, _ := mountMeta["bus"].(string)
+				if bus == "" {
+					bus = "sata"
+				}
+				readonly := true
+				if ro, ok := mountMeta["readOnly"].(bool); ok {
+					readonly = ro
+				} else if ro, ok := mountMeta["readonly"].(bool); ok {
+					readonly = ro
+				}
+				disks = append(disks, map[string]interface{}{"name": name, "serial": vmDiskSerial(mount.Name),
+					"cdrom": map[string]interface{}{"bus": bus, "readonly": readonly}})
+			} else {
+				disks = append(disks, map[string]interface{}{"name": name, "serial": vmDiskSerial(mount.Name),
+					"disk": map[string]interface{}{"bus": "virtio"}})
+			}
 			volumes = append(volumes, map[string]interface{}{"name": name,
 				"dataVolume": map[string]interface{}{"name": mount.Name}})
 		}
