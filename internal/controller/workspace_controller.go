@@ -458,6 +458,36 @@ func (r *WorkspaceReconciler) reconcileDeployment(ctx context.Context, instance 
 	return found.Status.ReadyReplicas, pod, nil
 }
 
+// lookupVMImage resolves the Image CR backing the workspace's main container
+// image so its declared defaults can seed cloud-init, the persistent root disk
+// and memory overrides. Workspaces that carry an explicit VMProfile (Windows)
+// are profile-driven and skip the ref lookup entirely — there is no Image CR to
+// find, so a "not found" is only logged when a lookup actually ran.
+func (r *WorkspaceReconciler) lookupVMImage(ctx context.Context, instance *kubeworkspacesiov1alpha1.Workspace) (*kubeworkspacesiov1alpha1.Image, error) {
+	log := logf.FromContext(ctx)
+
+	imageRef := ""
+	if len(instance.Spec.Template.Spec.Containers) > 0 {
+		imageRef = instance.Spec.Template.Spec.Containers[0].Image
+	}
+	log.Info("Looking up Image CR", "imageRef", imageRef)
+	if instance.Spec.VMProfile != nil {
+		log.Info("VM profile provided, skipping Image CR lookup", "image", imageRef)
+		return nil, nil
+	}
+	img, err := imageByRef(ctx, r.Client, imageRef)
+	if err != nil {
+		log.Error(err, "unable to look up Image CR for cloud-init seeding")
+		return nil, err
+	}
+	if img == nil {
+		log.Info("Image CR not found for image ref", "image", imageRef)
+	} else {
+		log.Info("Found Image CR", "name", img.Name, "image", img.Spec.Image, "memoryLimit", img.Spec.MemoryLimit)
+	}
+	return img, nil
+}
+
 // reconcileVirtualMachine handles vm-type workspaces: a KubeVirt VirtualMachine
 // whose root disk is a containerDisk built from the workspace's main container
 // image. Status is derived from the virt-launcher pod, which KubeVirt labels
@@ -472,24 +502,9 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 	// KubeVirt admission webhook rejects inline user-data larger than 2048
 	// bytes). The Image CR also drives the persistent root-disk (DataVolume) and
 	// memory overrides for desktop images.
-	imageRef := ""
-	if len(instance.Spec.Template.Spec.Containers) > 0 {
-		imageRef = instance.Spec.Template.Spec.Containers[0].Image
-	}
-	log.Info("Looking up Image CR", "imageRef", imageRef)
-	var img *kubeworkspacesiov1alpha1.Image
-	var err error
-	if instance.Spec.VMProfile == nil {
-		img, err = imageByRef(ctx, r.Client, imageRef)
-	}
+	img, err := r.lookupVMImage(ctx, instance)
 	if err != nil {
-		log.Error(err, "unable to look up Image CR for cloud-init seeding")
 		return 0, nil, err
-	}
-	if img == nil {
-		log.Info("Image CR not found for image ref", "image", imageRef)
-	} else {
-		log.Info("Found Image CR", "name", img.Name, "image", img.Spec.Image, "memoryLimit", img.Spec.MemoryLimit)
 	}
 	resolved, err := r.resolveWindowsProfile(ctx, instance, img)
 	if err != nil {
@@ -1264,32 +1279,8 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 	}
 
 	// A single masquerade interface on the pod network, forwarding every
-	// declared container port. KubeVirt rejects multiple interfaces bound to
-	// the same pod network.
-	interfaces := []interface{}{}
-	networks := []interface{}{
-		map[string]interface{}{"name": "default", "pod": map[string]interface{}{}},
-	}
-	if len(podSpec.Containers) > 0 {
-		ports := podSpec.Containers[0].Ports
-		if len(ports) == 0 {
-			ports = []corev1.ContainerPort{{ContainerPort: DefaultContainerPort}}
-		}
-		fwd := make([]interface{}, 0, len(ports))
-		for _, p := range ports {
-			fwd = append(fwd, map[string]interface{}{"port": int64(p.ContainerPort), "protocol": "TCP"})
-		}
-		interfaces = append(interfaces, map[string]interface{}{
-			"name":       "default",
-			"masquerade": map[string]interface{}{},
-			"ports":      fwd,
-			// Pin a deterministic MAC derived from the workspace name so the
-			// guest NIC address survives VMI recreation (KubeVirt otherwise
-			// rolls a fresh random MAC on every start, which can strand DHCP
-			// bindings, DNS leases and time-based networking configs).
-			"macAddress": macAddressForWorkspace(instance.Name),
-		})
-	}
+	// declared container port (see vmDefaultNetwork).
+	interfaces, networks := vmDefaultNetwork(instance.Name, podSpec)
 
 	// Root disk: an ephemeral containerDisk by default; a registry-imported
 	// DataVolume (persistent PVC) when the image opts in via PersistentRootDisk.
@@ -1347,50 +1338,12 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 		})
 		volumes = append(volumes, cloudInitVolume(instance.Name, cloudUserData))
 	}
-	if len(podSpec.Containers) > 0 {
-		// Look up volume mount metadata from unstructured instance if available
-		var volumeMountMeta map[string]map[string]interface{}
-		if len(instUnstructured) > 0 && instUnstructured[0] != nil {
-			if containers, _, _ := unstructured.NestedSlice(instUnstructured[0].Object, "spec", "template", "spec", "containers"); len(containers) > 0 {
-				if c, ok := containers[0].(map[string]interface{}); ok {
-					if vms, _, _ := unstructured.NestedSlice(c, "volumeMounts"); len(vms) > 0 {
-						volumeMountMeta = make(map[string]map[string]interface{}, len(vms))
-						for _, vm := range vms {
-							if vmMap, ok := vm.(map[string]interface{}); ok {
-								if name, ok := vmMap["name"].(string); ok {
-									volumeMountMeta[name] = vmMap
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-		for _, mount := range podSpec.Containers[0].VolumeMounts {
-			name := "data-" + vmDiskSerial(mount.Name)
-			mountMeta := volumeMountMeta[mount.Name]
-			mountType, _ := mountMeta["type"].(string)
-			if mountType == "cdrom" {
-				bus, _ := mountMeta["bus"].(string)
-				if bus == "" {
-					bus = "sata"
-				}
-				readonly := true
-				if ro, ok := mountMeta["readOnly"].(bool); ok {
-					readonly = ro
-				} else if ro, ok := mountMeta["readonly"].(bool); ok {
-					readonly = ro
-				}
-				disks = append(disks, map[string]interface{}{"name": name, "serial": vmDiskSerial(mount.Name),
-					"cdrom": map[string]interface{}{"bus": bus, "readonly": readonly}})
-			} else {
-				disks = append(disks, map[string]interface{}{"name": name, "serial": vmDiskSerial(mount.Name),
-					"disk": map[string]interface{}{"bus": "virtio"}})
-			}
-			volumes = append(volumes, map[string]interface{}{"name": name,
-				"dataVolume": map[string]interface{}{"name": mount.Name}})
-		}
-	}
+	// Guest data disks declared as container volumeMounts (see
+	// appendVMDataMounts): virtio disk by default, CD-ROM when the mount says
+	// so in the unstructured Workspace metadata.
+	mountDisks, mountVolumes := appendVMDataMounts(podSpec, instUnstructured)
+	disks = append(disks, mountDisks...)
+	volumes = append(volumes, mountVolumes...)
 
 	// VMI template labels: workspace-name drives the controller's pod watch;
 	// KubeVirt also adds vm.kubevirt.io/name itself.
@@ -1485,6 +1438,110 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 	}}
 	vm.SetGroupVersionKind(kubeVirtVirtualMachineGVK)
 	return vm
+}
+
+// vmDefaultNetwork builds the VM's single masquerade interface on the pod
+// network, forwarding every declared container port (DefaultContainerPort when
+// the container declares none). KubeVirt rejects multiple interfaces bound to
+// the same pod network. The interface carries a deterministic MAC derived from
+// the workspace name so the guest NIC address survives VMI recreation (KubeVirt
+// otherwise rolls a fresh random MAC on every start, which can strand DHCP
+// bindings, DNS leases and time-based networking configs).
+func vmDefaultNetwork(workspaceName string, podSpec corev1.PodSpec) (interfaces, networks []interface{}) {
+	interfaces = []interface{}{}
+	networks = []interface{}{
+		map[string]interface{}{"name": "default", "pod": map[string]interface{}{}},
+	}
+	if len(podSpec.Containers) == 0 {
+		return interfaces, networks
+	}
+	ports := podSpec.Containers[0].Ports
+	if len(ports) == 0 {
+		ports = []corev1.ContainerPort{{ContainerPort: DefaultContainerPort}}
+	}
+	fwd := make([]interface{}, 0, len(ports))
+	for _, p := range ports {
+		fwd = append(fwd, map[string]interface{}{"port": int64(p.ContainerPort), "protocol": "TCP"})
+	}
+	interfaces = append(interfaces, map[string]interface{}{
+		"name":       "default",
+		"masquerade": map[string]interface{}{},
+		"ports":      fwd,
+		"macAddress": macAddressForWorkspace(workspaceName),
+	})
+	return interfaces, networks
+}
+
+// appendVMDataMounts renders the workspace's container volumeMounts as guest
+// disks: one disk plus its dataVolume per mount. A mount whose unstructured
+// Workspace metadata declares type=cdrom becomes a CD-ROM (default bus sata,
+// read-only unless the metadata says otherwise); everything else stays a
+// virtio disk. The metadata carries the typed CD-ROM fields that the Go
+// Workspace struct cannot express (see vmVolumeMountMeta).
+func appendVMDataMounts(podSpec corev1.PodSpec, instUnstructured []*unstructured.Unstructured) (disks, volumes []interface{}) {
+	if len(podSpec.Containers) == 0 {
+		return disks, volumes
+	}
+	volumeMountMeta := vmVolumeMountMeta(instUnstructured)
+	for _, mount := range podSpec.Containers[0].VolumeMounts {
+		name := "data-" + vmDiskSerial(mount.Name)
+		mountMeta := volumeMountMeta[mount.Name]
+		mountType, _ := mountMeta["type"].(string)
+		if mountType == "cdrom" {
+			bus, _ := mountMeta["bus"].(string)
+			if bus == "" {
+				bus = "sata"
+			}
+			readonly := true
+			if ro, ok := mountMeta["readOnly"].(bool); ok {
+				readonly = ro
+			} else if ro, ok := mountMeta["readonly"].(bool); ok {
+				readonly = ro
+			}
+			disks = append(disks, map[string]interface{}{"name": name, "serial": vmDiskSerial(mount.Name),
+				"cdrom": map[string]interface{}{"bus": bus, "readonly": readonly}})
+		} else {
+			disks = append(disks, map[string]interface{}{"name": name, "serial": vmDiskSerial(mount.Name),
+				"disk": map[string]interface{}{"bus": "virtio"}})
+		}
+		volumes = append(volumes, map[string]interface{}{"name": name,
+			"dataVolume": map[string]interface{}{"name": mount.Name}})
+	}
+	return disks, volumes
+}
+
+// vmVolumeMountMeta reads the first container's volumeMount metadata from the
+// unstructured Workspace instance, keyed by mount name, or nil when the
+// instance carries no volumeMount metadata at all.
+func vmVolumeMountMeta(instUnstructured []*unstructured.Unstructured) map[string]map[string]interface{} {
+	if len(instUnstructured) == 0 || instUnstructured[0] == nil {
+		return nil
+	}
+	containers, _, _ := unstructured.NestedSlice(instUnstructured[0].Object, "spec", "template", "spec", "containers")
+	if len(containers) == 0 {
+		return nil
+	}
+	c, ok := containers[0].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	vms, _, _ := unstructured.NestedSlice(c, "volumeMounts")
+	if len(vms) == 0 {
+		return nil
+	}
+	volumeMountMeta := make(map[string]map[string]interface{}, len(vms))
+	for _, vm := range vms {
+		vmMap, ok := vm.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, ok := vmMap["name"].(string)
+		if !ok {
+			continue
+		}
+		volumeMountMeta[name] = vmMap
+	}
+	return volumeMountMeta
 }
 
 // vmDomainResources assembles the KubeVirt domain.resources declaration from
