@@ -859,7 +859,18 @@ func (r *WorkspaceReconciler) podByLabel(ctx context.Context, namespace, selecto
 func (r *WorkspaceReconciler) reconcileService(ctx context.Context, instance *kubeworkspacesiov1alpha1.Workspace, wsType string) error {
 	log := logf.FromContext(ctx)
 
-	service := generateService(instance, wsType)
+	// Agent data plane for VM workspaces whose image declares an agent port.
+	// Lookup failure must not break Service reconcile: proceed without the
+	// agent port (proxy refuses honestly) rather than failing closed here.
+	var agentPort int32
+	if wsType == WorkspaceTypeVM {
+		if img, err := r.lookupVMImage(ctx, instance); err != nil {
+			log.Info("Agent port lookup failed, continuing without it", "error", err)
+		} else {
+			agentPort = agentPortForImage(img)
+		}
+	}
+	service := generateService(instance, wsType, agentPort)
 	if err := ctrl.SetControllerReference(instance, service, r.Scheme); err != nil {
 		return err
 	}
@@ -1118,6 +1129,21 @@ func macAddressForWorkspace(name string) string {
 	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5])
 }
 
+// agentPortForImage returns the workspace-agent guest port declared by the
+// Image (proxyConfig.agentPort), or 0 when unset, out of range, or there is
+// no image. Zero disables the agent data plane: no masquerade forward, no
+// Service port, and the proxy refuses with 503.
+func agentPortForImage(img *kubeworkspacesiov1alpha1.Image) int32 {
+	if img == nil || img.Spec.ProxyConfig == nil {
+		return 0
+	}
+	port := img.Spec.ProxyConfig.AgentPort
+	if port < 1 || port > 65535 {
+		return 0
+	}
+	return port
+}
+
 // gpuDevicesFromLimits builds the KubeVirt `domain.devices.gpus[]` list from a
 // container's resource limits. Any resource whose name KubeVirt recognises as a
 // GPU (a vendor GPU resource like nvidia.com/gpu / amd.com/gpu / intel.com/gpu,
@@ -1279,8 +1305,9 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 	}
 
 	// A single masquerade interface on the pod network, forwarding every
-	// declared container port (see vmDefaultNetwork).
-	interfaces, networks := vmDefaultNetwork(instance.Name, podSpec)
+	// declared container port (see vmDefaultNetwork) plus the agent port when
+	// the image declares one.
+	interfaces, networks := vmDefaultNetwork(instance.Name, podSpec, agentPortForImage(img))
 
 	// Root disk: an ephemeral containerDisk by default; a registry-imported
 	// DataVolume (persistent PVC) when the image opts in via PersistentRootDisk.
@@ -1442,12 +1469,13 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 
 // vmDefaultNetwork builds the VM's single masquerade interface on the pod
 // network, forwarding every declared container port (DefaultContainerPort when
-// the container declares none). KubeVirt rejects multiple interfaces bound to
-// the same pod network. The interface carries a deterministic MAC derived from
-// the workspace name so the guest NIC address survives VMI recreation (KubeVirt
+// the container declares none) plus the agent port when positive and not
+// already declared. KubeVirt rejects multiple interfaces bound to the same
+// pod network. The interface carries a deterministic MAC derived from the
+// workspace name so the guest NIC address survives VMI recreation (KubeVirt
 // otherwise rolls a fresh random MAC on every start, which can strand DHCP
 // bindings, DNS leases and time-based networking configs).
-func vmDefaultNetwork(workspaceName string, podSpec corev1.PodSpec) (interfaces, networks []interface{}) {
+func vmDefaultNetwork(workspaceName string, podSpec corev1.PodSpec, agentPort int32) (interfaces, networks []interface{}) {
 	interfaces = []interface{}{}
 	networks = []interface{}{
 		map[string]interface{}{"name": "default", "pod": map[string]interface{}{}},
@@ -1459,9 +1487,14 @@ func vmDefaultNetwork(workspaceName string, podSpec corev1.PodSpec) (interfaces,
 	if len(ports) == 0 {
 		ports = []corev1.ContainerPort{{ContainerPort: DefaultContainerPort}}
 	}
-	fwd := make([]interface{}, 0, len(ports))
+	declared := map[int32]bool{}
+	fwd := make([]interface{}, 0, len(ports)+1)
 	for _, p := range ports {
 		fwd = append(fwd, map[string]interface{}{"port": int64(p.ContainerPort), "protocol": "TCP"})
+		declared[p.ContainerPort] = true
+	}
+	if agentPort > 0 && !declared[agentPort] {
+		fwd = append(fwd, map[string]interface{}{"port": int64(agentPort), "protocol": "TCP"})
 	}
 	interfaces = append(interfaces, map[string]interface{}{
 		"name":       "default",
@@ -1840,8 +1873,9 @@ func deploymentNeedsUpdate(desired, current *appsv1.Deployment) bool {
 // and additional ports are exposed on their own port number.
 // The selector matches the workload type: StatefulSet pods for container,
 // workspace-name labelled pods for vm and scratch.
-func generateService(instance *kubeworkspacesiov1alpha1.Workspace, wsType string) *corev1.Service {
+func generateService(instance *kubeworkspacesiov1alpha1.Workspace, wsType string, agentPort int32) *corev1.Service {
 	servicePorts := []corev1.ServicePort{}
+	present := map[int32]bool{}
 
 	if len(instance.Spec.Template.Spec.Containers) > 0 {
 		containerPorts := instance.Spec.Template.Spec.Containers[0].Ports
@@ -1853,6 +1887,7 @@ func generateService(instance *kubeworkspacesiov1alpha1.Workspace, wsType string
 				TargetPort: intstr.FromInt32(containerPorts[0].ContainerPort),
 				Protocol:   "TCP",
 			})
+			present[containerPorts[0].ContainerPort] = true
 			// Additional ports are exposed on their own port number
 			for i := 1; i < len(containerPorts); i++ {
 				cp := containerPorts[i]
@@ -1866,8 +1901,20 @@ func generateService(instance *kubeworkspacesiov1alpha1.Workspace, wsType string
 					TargetPort: intstr.FromInt32(cp.ContainerPort),
 					Protocol:   "TCP",
 				})
+				present[cp.ContainerPort] = true
 			}
 		}
+	}
+
+	// Agent data plane: expose the guest agent port on its own number when
+	// declared and not already covered. Absent by default (agentPort 0).
+	if agentPort > 0 && !present[agentPort] {
+		servicePorts = append(servicePorts, corev1.ServicePort{
+			Name:       "agent",
+			Port:       agentPort,
+			TargetPort: intstr.FromInt32(agentPort),
+			Protocol:   "TCP",
+		})
 	}
 
 	// Fallback: if no ports were found, use defaults

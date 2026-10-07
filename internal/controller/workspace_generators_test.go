@@ -791,13 +791,13 @@ func TestMacAddressForWorkspace(t *testing.T) {
 func TestGenerateServiceSelectors(t *testing.T) {
 	ws := testWorkspace(WorkspaceTypeContainer, nil)
 
-	containerSvc := generateService(ws, WorkspaceTypeContainer)
+	containerSvc := generateService(ws, WorkspaceTypeContainer, 0)
 	if containerSvc.Spec.Selector["statefulset"] != testWorkspaceName {
 		t.Errorf("container service should select statefulset label: %v", containerSvc.Spec.Selector)
 	}
 
 	for _, wsType := range []string{WorkspaceTypeVM, WorkspaceTypeScratch} {
-		svc := generateService(ws, wsType)
+		svc := generateService(ws, wsType, 0)
 		if svc.Spec.Selector[LabelWorkspaceName] != testWorkspaceName {
 			t.Errorf("%s service should select workspace-name label: %v", wsType, svc.Spec.Selector)
 		}
@@ -807,7 +807,7 @@ func TestGenerateServiceSelectors(t *testing.T) {
 	}
 
 	// First container port maps to Service port 80
-	svc := generateService(ws, WorkspaceTypeVM)
+	svc := generateService(ws, WorkspaceTypeVM, 0)
 	if svc.Spec.Ports[0].Port != DefaultServingPort {
 		t.Errorf("expected first service port 80, got %d", svc.Spec.Ports[0].Port)
 	}

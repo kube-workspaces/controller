@@ -271,6 +271,13 @@ type ImageProxyConfig struct {
 	// requests matching /audio/ to this port instead of the default workspace port.
 	// +optional
 	AudioPort int32 `json:"audioPort,omitempty"`
+	// AgentPort: guest TCP port of the workspace-agent listener. When set on a
+	// VM image, the controller forwards it through the KubeVirt masquerade
+	// interface and exposes it on the workspace Service, and the proxy serves
+	// the /agent/ bridge against it. 0 (unset) disables the agent data plane
+	// entirely: no masquerade forward, no Service port, proxy refuses with 503.
+	// +optional
+	AgentPort int32 `json:"agentPort,omitempty"`
 	// Port: the workspace Service port the proxy targets instead of the default
 	// 80. The workspace Service maps the first container port to Service port 80
 	// and exposes additional container ports on their own port numbers; images
