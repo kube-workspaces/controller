@@ -59,7 +59,7 @@ func TestWindowsNativeSetupAndPhysicalBootstrapRemoval(t *testing.T) {
 	if err != nil || ready {
 		t.Fatalf("must detach media before readiness: %v", err)
 	}
-	vm := generateWindowsVirtualMachine(ws)
+	vm := generateWindowsVirtualMachine(ws, 0)
 	running, _, _ := unstructured.NestedBool(vm.Object, "spec", "running")
 	if running {
 		t.Fatal("bootstrap removal must request graceful shutdown")
@@ -85,7 +85,7 @@ func TestWindowsNativeSetupAndPhysicalBootstrapRemoval(t *testing.T) {
 	if err := r.reconcileWindowsBootstrap(ctx, ws); err != nil {
 		t.Fatal(err)
 	}
-	vm = generateWindowsVirtualMachine(ws)
+	vm = generateWindowsVirtualMachine(ws, 0)
 	volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
 	if len(volumes) != 1 {
 		t.Fatal("ordinary restart reattached bootstrap media")
@@ -134,7 +134,7 @@ func TestWindowsHardwareAndSourceIdentity(t *testing.T) {
 	if err := validateWindowsProfile(ws); err != nil {
 		t.Fatal(err)
 	}
-	vm := generateVirtualMachine(ws, &workspacev1.Image{Spec: workspacev1.ImageSpec{DefaultCloudInit: true, DefaultUser: "linux", DefaultUserData: "linux-data", VideoDevice: "virtio"}}, []string{"linux-key"})
+	vm := generateVirtualMachine(ws, &workspacev1.Image{Spec: workspacev1.ImageSpec{DefaultCloudInit: true, DefaultUser: "linux", DefaultUserData: "linux-data", VideoDevice: "virtio"}}, []string{"linux-key"}, 0)
 	for _, path := range [][]string{{"spec", "template", "spec", "domain", "firmware", "bootloader", "efi", "secureBoot"}, {"spec", "template", "spec", "domain", "firmware", "bootloader", "efi", "persistent"}, {"spec", "template", "spec", "domain", "devices", "tpm", "persistent"}, {"spec", "template", "spec", "domain", "features", "smm", "enabled"}} {
 		value, _, _ := unstructured.NestedBool(vm.Object, path...)
 		if !value {

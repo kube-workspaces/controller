@@ -529,7 +529,7 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 	if err := r.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, instUnstructured); err != nil {
 		return 0, nil, err
 	}
-	desired := generateVirtualMachine(instance, img, sshKeys, instUnstructured)
+	desired := generateVirtualMachine(instance, img, sshKeys, agentPortForImage(agentImageForWorkspace(ctx, r.Client, instance)), instUnstructured)
 	if err := ctrl.SetControllerReference(instance, desired, r.Scheme); err != nil {
 		return 0, nil, err
 	}
@@ -860,15 +860,13 @@ func (r *WorkspaceReconciler) reconcileService(ctx context.Context, instance *ku
 	log := logf.FromContext(ctx)
 
 	// Agent data plane for VM workspaces whose image declares an agent port.
+	// Resolved independently of the provisioning profile so Windows
+	// (vmProfile) guests pick up a digest-pinned Image's agentPort too.
 	// Lookup failure must not break Service reconcile: proceed without the
 	// agent port (proxy refuses honestly) rather than failing closed here.
 	var agentPort int32
 	if wsType == WorkspaceTypeVM {
-		if img, err := r.lookupVMImage(ctx, instance); err != nil {
-			log.Info("Agent port lookup failed, continuing without it", "error", err)
-		} else {
-			agentPort = agentPortForImage(img)
-		}
+		agentPort = agentPortForImage(agentImageForWorkspace(ctx, r.Client, instance))
 	}
 	service := generateService(instance, wsType, agentPort)
 	if err := ctrl.SetControllerReference(instance, service, r.Scheme); err != nil {
@@ -1144,6 +1142,29 @@ func agentPortForImage(img *kubeworkspacesiov1alpha1.Image) int32 {
 	return port
 }
 
+// agentImageForWorkspace resolves the Image CR declaring the agent data-plane
+// port for a workspace, independent of the provisioning profile. Windows
+// (vmProfile) workspaces skip the general lookupVMImage path (no cloud-init
+// seeding), but the agent port is a separate read-only concern: when an Image
+// CR pins the workspace's exact container image digest (e.g. a private
+// Windows root), its proxyConfig.agentPort applies. Lookup failure or absence
+// returns nil (plane disabled); provisioning behavior is unchanged.
+func agentImageForWorkspace(ctx context.Context, reader client.Reader, instance *kubeworkspacesiov1alpha1.Workspace) *kubeworkspacesiov1alpha1.Image {
+	imageRef := ""
+	if len(instance.Spec.Template.Spec.Containers) > 0 {
+		imageRef = instance.Spec.Template.Spec.Containers[0].Image
+	}
+	if imageRef == "" {
+		return nil
+	}
+	img, err := imageByRef(ctx, reader, imageRef)
+	if err != nil {
+		logf.FromContext(ctx).Info("Agent Image lookup failed, continuing without agent port", "error", err)
+		return nil
+	}
+	return img
+}
+
 // gpuDevicesFromLimits builds the KubeVirt `domain.devices.gpus[]` list from a
 // container's resource limits. Any resource whose name KubeVirt recognises as a
 // GPU (a vendor GPU resource like nvidia.com/gpu / amd.com/gpu / intel.com/gpu,
@@ -1281,9 +1302,9 @@ func preserveLegacyRootDisk(desired, current *unstructured.Unstructured) {
 }
 
 // containerDisk roots are ephemeral, so cloud-init runs on every start.
-func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *kubeworkspacesiov1alpha1.Image, sshKeys []string, instUnstructured ...*unstructured.Unstructured) *unstructured.Unstructured {
+func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *kubeworkspacesiov1alpha1.Image, sshKeys []string, agentPort int32, instUnstructured ...*unstructured.Unstructured) *unstructured.Unstructured {
 	if windowsWorkspace(instance) {
-		return generateWindowsVirtualMachine(instance)
+		return generateWindowsVirtualMachine(instance, agentPort)
 	}
 	stopped := false
 	if _, ok := instance.Annotations[AnnotationStopped]; ok {
@@ -1306,8 +1327,9 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 
 	// A single masquerade interface on the pod network, forwarding every
 	// declared container port (see vmDefaultNetwork) plus the agent port when
-	// the image declares one.
-	interfaces, networks := vmDefaultNetwork(instance.Name, podSpec, agentPortForImage(img))
+	// the image declares one. The agent port arrives explicitly (not via img)
+	// so Windows vmProfile guests resolve their digest-pinned Image too.
+	interfaces, networks := vmDefaultNetwork(instance.Name, podSpec, agentPort)
 
 	// Root disk: an ephemeral containerDisk by default; a registry-imported
 	// DataVolume (persistent PVC) when the image opts in via PersistentRootDisk.

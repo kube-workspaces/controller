@@ -106,7 +106,7 @@ func TestGenerateDeployment(t *testing.T) {
 }
 
 func TestGenerateVirtualMachine(t *testing.T) {
-	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), nil, nil)
+	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), nil, nil, 0)
 
 	if vm.GetName() != testWorkspaceName || vm.GetNamespace() != "workspaces" {
 		t.Errorf("unexpected VM identity: %s/%s", vm.GetNamespace(), vm.GetName())
@@ -163,7 +163,7 @@ func TestGenerateVirtualMachine(t *testing.T) {
 }
 
 func TestGenerateVirtualMachineStopped(t *testing.T) {
-	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, map[string]string{AnnotationStopped: "true"}), nil, nil)
+	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, map[string]string{AnnotationStopped: "true"}), nil, nil, 0)
 	running, _, _ := unstructured.NestedBool(vm.Object, "spec", "running")
 	if running {
 		t.Error("expected spec.running=false for a stopped workspace")
@@ -179,7 +179,7 @@ func TestGenerateVirtualMachineWithCloudInit(t *testing.T) {
 			DefaultUserData: userData,
 		},
 	}
-	vm := generateVirtualMachine(ws, img, nil)
+	vm := generateVirtualMachine(ws, img, nil, 0)
 
 	volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
 	if len(volumes) != 2 {
@@ -200,7 +200,7 @@ func TestGenerateVirtualMachineWithCloudInit(t *testing.T) {
 }
 
 func TestGenerateVirtualMachineNoCloudInit(t *testing.T) {
-	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), nil, nil)
+	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), nil, nil, 0)
 	volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
 	if len(volumes) != 1 {
 		t.Fatalf("expected 1 volume without cloud-init, got %d", len(volumes))
@@ -250,7 +250,7 @@ func TestGenerateVirtualMachineCloudInitSecretRef(t *testing.T) {
 			DefaultUserData: largeCloudConfig(t),
 		},
 	}
-	vm := generateVirtualMachine(ws, img, nil)
+	vm := generateVirtualMachine(ws, img, nil, 0)
 
 	volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
 	if len(volumes) != 2 {
@@ -298,7 +298,7 @@ func TestGenerateVirtualMachineVideoDevice(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), tc.img, nil)
+			vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), tc.img, nil, 0)
 			video, found, _ := unstructured.NestedMap(vm.Object, "spec", "template", "spec", "domain", "devices", "video")
 			if tc.want == "" {
 				if found {
@@ -343,7 +343,7 @@ func TestGenerateVirtualMachineSoundDevice(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), tc.img, nil)
+			vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), tc.img, nil, 0)
 			sound, found, _ := unstructured.NestedMap(vm.Object, "spec", "template", "spec", "domain", "devices", "sound")
 			if tc.want == "" {
 				if found {
@@ -375,7 +375,7 @@ func testWorkspaceWithGPU(wsType, gpuResource string) *kubeworkspacesiov1alpha1.
 
 func TestGenerateVirtualMachineGPU(t *testing.T) {
 	ws := testWorkspaceWithGPU(WorkspaceTypeVM, testNvidiaGPUResource)
-	vm := generateVirtualMachine(ws, nil, nil)
+	vm := generateVirtualMachine(ws, nil, nil, 0)
 
 	// The GPU resource must appear in domain.resources.limits (already copied
 	// from the container) so KubeVirt has the scheduling resource.
@@ -399,7 +399,7 @@ func TestGenerateVirtualMachineGPU(t *testing.T) {
 }
 
 func TestGenerateVirtualMachineNoGPU(t *testing.T) {
-	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), nil, nil)
+	vm := generateVirtualMachine(testWorkspace(WorkspaceTypeVM, nil), nil, nil, 0)
 	gpus, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "domain", "devices", "gpus")
 	if len(gpus) != 0 {
 		t.Errorf("expected no gpus without a GPU request, got %d", len(gpus))
@@ -412,7 +412,7 @@ func TestGenerateVirtualMachineScheduling(t *testing.T) {
 	ws.Spec.Template.Spec.Tolerations = []corev1.Toleration{
 		{Key: testNvidiaGPUResource, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
 	}
-	vm := generateVirtualMachine(ws, nil, nil)
+	vm := generateVirtualMachine(ws, nil, nil, 0)
 
 	ns, _, _ := unstructured.NestedStringMap(vm.Object, "spec", "template", "spec", "nodeSelector")
 	if ns["nvidia.com/gpu.present"] != "true" {
@@ -469,7 +469,7 @@ func TestGenerateVirtualMachinePersistentRootDisk(t *testing.T) {
 			DefaultUserData:        "#cloud-config\npackages: [task-gnome-desktop]\n",
 		},
 	}
-	vm := generateVirtualMachine(ws, img, nil)
+	vm := generateVirtualMachine(ws, img, nil, 0)
 
 	// No containerDisk; root is a dataVolume referencing the template.
 	volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
@@ -520,7 +520,7 @@ func TestPersistentRootDisksAreIsolated(t *testing.T) {
 	for _, name := range []string{"desktop", "desktop-clone", strings.Repeat("a", 252) + "b", strings.Repeat("a", 252) + "c"} {
 		ws := testWorkspace(WorkspaceTypeVM, nil)
 		ws.Name = name
-		vm := generateVirtualMachine(ws, img, nil)
+		vm := generateVirtualMachine(ws, img, nil, 0)
 		templates, _, _ := unstructured.NestedSlice(vm.Object, "spec", "dataVolumeTemplates")
 		diskName := templates[0].(map[string]interface{})["metadata"].(map[string]interface{})["name"].(string)
 		if len(diskName) > 253 || seen[diskName] {
@@ -538,13 +538,13 @@ func TestPersistentRootDisksAreIsolated(t *testing.T) {
 func TestPreserveLegacyRootDisk(t *testing.T) {
 	ws := testWorkspace(WorkspaceTypeVM, nil)
 	img := &kubeworkspacesiov1alpha1.Image{Spec: kubeworkspacesiov1alpha1.ImageSpec{PersistentRootDisk: true}}
-	current := generateVirtualMachine(ws, img, nil)
+	current := generateVirtualMachine(ws, img, nil, 0)
 	volumes, _, _ := unstructured.NestedSlice(current.Object, "spec", "template", "spec", "volumes")
 	volumes[0].(map[string]interface{})["dataVolume"] = map[string]interface{}{"name": testLegacyRootDiskName}
 	_ = unstructured.SetNestedSlice(current.Object, volumes, "spec", "template", "spec", "volumes")
 	for _, preserve := range []bool{false, true} {
 		current.SetAnnotations(map[string]string{AnnotationLegacyRootDisk: strconv.FormatBool(preserve)})
-		desired := generateVirtualMachine(ws, img, nil)
+		desired := generateVirtualMachine(ws, img, nil, 0)
 		preserveLegacyRootDisk(desired, current)
 		want := ws.Name + "-rootdisk"
 		if preserve {
@@ -562,7 +562,7 @@ func TestPreserveLegacyRootDisk(t *testing.T) {
 func TestVirtualMachineNeedsUpdateWithAdmissionDefaults(t *testing.T) {
 	ws := testWorkspace(WorkspaceTypeVM, nil)
 	img := &kubeworkspacesiov1alpha1.Image{Spec: kubeworkspacesiov1alpha1.ImageSpec{PersistentRootDisk: true}}
-	desired := generateVirtualMachine(ws, img, nil)
+	desired := generateVirtualMachine(ws, img, nil, 0)
 	current := desired.DeepCopy()
 	_ = unstructured.SetNestedField(current.Object, "amd64", "spec", "template", "spec", "architecture")
 	_ = unstructured.SetNestedField(current.Object, "q35", "spec", "template", "spec", "domain", "machine", "type")
@@ -615,7 +615,7 @@ func TestGenerateVirtualMachineMemoryOverrideWithoutPersistentRoot(t *testing.T)
 			MemoryLimit: "2Gi",
 		},
 	}
-	vm := generateVirtualMachine(ws, img, nil)
+	vm := generateVirtualMachine(ws, img, nil, 0)
 
 	volumes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
 	root := volumes[0].(map[string]interface{})
@@ -645,7 +645,7 @@ func TestGenerateVirtualMachineMemoryRequestDecouplesPodFromGuest(t *testing.T) 
 			MemoryRequest:      "5Gi",
 		},
 	}
-	vm := generateVirtualMachine(ws, img, nil)
+	vm := generateVirtualMachine(ws, img, nil, 0)
 
 	// Pod allocation (both request and limit) reflects MemoryRequest...
 	limits, _, _ := unstructured.NestedStringMap(vm.Object, "spec", "template", "spec", "domain", "resources", "limits")

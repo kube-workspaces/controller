@@ -515,7 +515,7 @@ func windowsStatusConditions(instance *workspacev1.Workspace, status *workspacev
 	}
 }
 
-func generateWindowsVirtualMachine(instance *workspacev1.Workspace) *unstructured.Unstructured {
+func generateWindowsVirtualMachine(instance *workspacev1.Workspace, agentPort int32) *unstructured.Unstructured {
 	profile := instance.Spec.VMProfile
 	identity := windowsIdentity(instance)
 	macsum := sha256.Sum256([]byte(identity))
@@ -545,13 +545,20 @@ func generateWindowsVirtualMachine(instance *workspacev1.Workspace) *unstructure
 	guest := resource.MustParse(profile.GuestMemory)
 	podMemory := guest.DeepCopy()
 	podMemory.Add(resource.MustParse("1Gi"))
+	// Agent data plane: forward the guest agent port through the masquerade
+	// interface when the digest-pinned Image declares one. Same forward shape
+	// as the generic vmDefaultNetwork path; absent (0) by default.
+	defaultInterface := map[string]interface{}{"name": "default", "model": "virtio", "macAddress": mac, "masquerade": map[string]interface{}{}}
+	if agentPort > 0 {
+		defaultInterface["ports"] = []interface{}{map[string]interface{}{"port": int64(agentPort), "protocol": "TCP"}}
+	}
 	domain := map[string]interface{}{
 		"machine": map[string]interface{}{"type": "q35"}, "cpu": map[string]interface{}{"cores": int64(profile.CPUCores), "model": "host-passthrough"},
 		"memory": map[string]interface{}{"guest": guest.String()}, "resources": map[string]interface{}{"requests": map[string]interface{}{"memory": podMemory.String()}},
 		"firmware": map[string]interface{}{"uuid": identity, "bootloader": map[string]interface{}{"efi": map[string]interface{}{"secureBoot": true, "persistent": true}}},
 		"features": map[string]interface{}{"acpi": map[string]interface{}{"enabled": true}, "smm": map[string]interface{}{"enabled": true}, "hyperv": map[string]interface{}{"relaxed": map[string]interface{}{"enabled": true}, "vapic": map[string]interface{}{"enabled": true}, "spinlocks": map[string]interface{}{"enabled": true, "spinlocks": int64(8191)}}},
 		"clock":    map[string]interface{}{"utc": map[string]interface{}{}, "timer": map[string]interface{}{"hpet": map[string]interface{}{"present": false}, "pit": map[string]interface{}{"tickPolicy": "delay"}, "rtc": map[string]interface{}{"tickPolicy": "catchup"}, "hyperv": map[string]interface{}{"present": true}}},
-		"devices":  map[string]interface{}{"tpm": map[string]interface{}{"persistent": true}, "autoattachGraphicsDevice": true, "autoattachSerialConsole": false, "video": map[string]interface{}{"type": "vga"}, "disks": disks, "inputs": []interface{}{map[string]interface{}{"name": "tablet", "type": "tablet", "bus": "usb"}}, "interfaces": []interface{}{map[string]interface{}{"name": "default", "model": "virtio", "macAddress": mac, "masquerade": map[string]interface{}{}}}},
+		"devices":  map[string]interface{}{"tpm": map[string]interface{}{"persistent": true}, "autoattachGraphicsDevice": true, "autoattachSerialConsole": false, "video": map[string]interface{}{"type": "vga"}, "disks": disks, "inputs": []interface{}{map[string]interface{}{"name": "tablet", "type": "tablet", "bus": "usb"}}, "interfaces": []interface{}{defaultInterface}},
 	}
 	_, stopped := instance.Annotations[AnnotationStopped]
 	stopped = stopped || instance.Annotations[windowsDetachingGeneration] == profile.Generation

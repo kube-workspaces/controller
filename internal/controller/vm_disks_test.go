@@ -75,7 +75,7 @@ func TestVMDataDiskCloudInit(t *testing.T) {
 	if len(commands) != 2 || commands[0] != "echo existing" || !strings.Contains(commands[1].(string), "'\"'\"'") {
 		t.Fatal("preserve existing commands and shell-quote guest paths")
 	}
-	vm := generateVirtualMachine(ws, img, nil)
+	vm := generateVirtualMachine(ws, img, nil, 0)
 	disks, _, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "domain", "devices", "disks")
 	last := disks[len(disks)-1].(map[string]interface{})
 	if last["serial"] != vmDiskSerial("data") || len(vmDiskSerial("data")) > 20 {

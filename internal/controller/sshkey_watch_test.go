@@ -105,7 +105,7 @@ func TestGuestAgentSSHCredentials(t *testing.T) {
 	img.Spec.DefaultCloudInit = true
 	img.Spec.DefaultUser = testGuestUser
 	img.Spec.DefaultUserData = testCloudConfig
-	vm := generateVirtualMachine(ws, img, []string{"key-one"})
+	vm := generateVirtualMachine(ws, img, []string{"key-one"}, 0)
 	credentials, found, err := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "accessCredentials")
 	if err != nil || !found || len(credentials) != 1 {
 		t.Fatalf("missing guest-agent credentials: %v %v", credentials, err)
@@ -124,12 +124,12 @@ func TestGuestAgentSSHCredentials(t *testing.T) {
 		t.Fatal("managed keys must not be baked into cloud-init data")
 	}
 	// Key changes only update the Secret, not the VM template or running VMI.
-	rotated := generateVirtualMachine(ws, img, []string{"key-two"})
+	rotated := generateVirtualMachine(ws, img, []string{"key-two"}, 0)
 	if virtualMachineNeedsUpdate(rotated, vm) {
 		t.Fatal("key rotation must not change the VM template")
 	}
 	img.Spec.DefaultUser = ""
-	legacy := generateVirtualMachine(ws, img, []string{"key-one"})
+	legacy := generateVirtualMachine(ws, img, []string{"key-one"}, 0)
 	if _, found, _ := unstructured.NestedSlice(legacy.Object, "spec", "template", "spec", "accessCredentials"); found {
 		t.Fatal("a guest account is required for credential propagation")
 	}
@@ -138,7 +138,7 @@ func TestGuestAgentSSHCredentials(t *testing.T) {
 	}
 	img.Spec.DefaultUser = testGuestUser
 	img.Annotations = nil
-	legacy = generateVirtualMachine(ws, img, []string{"key-one"})
+	legacy = generateVirtualMachine(ws, img, []string{"key-one"}, 0)
 	if _, found, _ := unstructured.NestedSlice(legacy.Object, "spec", "template", "spec", "accessCredentials"); found {
 		t.Fatal("cloud-init capability alone must not opt a guest into agent-owned keys")
 	}

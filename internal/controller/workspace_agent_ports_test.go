@@ -17,9 +17,13 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	kubeworkspacesiov1alpha1 "github.com/kube-workspaces/controller/api/v1alpha1"
 )
@@ -164,5 +168,106 @@ func TestVMDefaultNetworkAgentPort(t *testing.T) {
 	}
 	if found != 1 {
 		t.Fatalf("declared agent port must not duplicate the forward, got %d: %v", found, again)
+	}
+}
+
+func windowsAgentTestImage(digest string, port int32) *kubeworkspacesiov1alpha1.Image {
+	img := testImageWithAgentPort(port)
+	img.ObjectMeta = metav1.ObjectMeta{Name: "windows11-pro-private"}
+	img.Spec.Image = digest
+	return img
+}
+
+func windowsMasqueradePorts(t *testing.T, vm *unstructured.Unstructured) []int64 {
+	t.Helper()
+	ifaces, _, err := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "domain", "devices", "interfaces")
+	if err != nil || len(ifaces) != 1 {
+		t.Fatalf("expected one windows interface, got %v: %v", ifaces, err)
+	}
+	iface, ok := ifaces[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("interface has unexpected shape: %T", ifaces[0])
+	}
+	raw, _, _ := unstructured.NestedSlice(iface, "ports")
+	ports := make([]int64, 0, len(raw))
+	for _, entry := range raw {
+		forward, ok := entry.(map[string]interface{})
+		if !ok {
+			t.Fatalf("forward has unexpected shape: %T", entry)
+		}
+		port, ok := forward["port"].(int64)
+		if !ok {
+			t.Fatalf("forward has no int64 port: %v", forward)
+		}
+		if proto, _, _ := unstructured.NestedString(forward, "protocol"); proto != "TCP" {
+			t.Fatalf("forward must be TCP, got %q", proto)
+		}
+		ports = append(ports, port)
+	}
+	return ports
+}
+
+// Regression: Windows vmProfile workspaces skip lookupVMImage, but the agent
+// port must still resolve from a digest-pinned Image CR (live: windows11-pro
+// reconciled with agentPort 0 despite the patched Image).
+func TestAgentImageForWorkspaceResolvesVmProfileDigest(t *testing.T) {
+	ws := windowsTestWorkspace()
+	digest := ws.Spec.Template.Spec.Containers[0].Image
+	cl := fake.NewClientBuilder().WithScheme(resetTestScheme(t)).
+		WithObjects(windowsAgentTestImage(digest, 44787)).Build()
+	found := agentImageForWorkspace(context.Background(), cl, ws)
+	if found == nil {
+		t.Fatal("vmProfile workspace must resolve its digest-pinned Image for the agent port")
+	}
+	if got := agentPortForImage(found); got != 44787 {
+		t.Fatalf("resolved Image must carry agentPort 44787, got %d", got)
+	}
+}
+
+func TestAgentImageForWorkspaceNilCases(t *testing.T) {
+	cl := fake.NewClientBuilder().WithScheme(resetTestScheme(t)).Build()
+	// No Image CRs at all: plane disabled, never an error.
+	if found := agentImageForWorkspace(context.Background(), cl, windowsTestWorkspace()); found != nil {
+		t.Fatalf("absent Image must disable the agent plane, got %v", found.Name)
+	}
+	// No containers: nothing to match on.
+	ws := testWorkspace(WorkspaceTypeVM, nil)
+	ws.Spec.Template.Spec.Containers = nil
+	if found := agentImageForWorkspace(context.Background(), cl, ws); found != nil {
+		t.Fatalf("imageless workspace must disable the agent plane, got %v", found.Name)
+	}
+}
+
+func TestWindowsVirtualMachineAgentPort(t *testing.T) {
+	ws := windowsTestWorkspace()
+	// Absent by default: no behavior change for existing Windows guests.
+	plain := windowsMasqueradePorts(t, generateWindowsVirtualMachine(ws, 0))
+	for _, p := range plain {
+		if p == 44787 {
+			t.Fatalf("agent forward must be absent by default: %v", plain)
+		}
+	}
+	// Declared: forwarded once over TCP on the masquerade interface.
+	withAgent := windowsMasqueradePorts(t, generateWindowsVirtualMachine(ws, 44787))
+	found := 0
+	for _, p := range withAgent {
+		if p == 44787 {
+			found++
+		}
+	}
+	if found != 1 {
+		t.Fatalf("agent forward must appear exactly once, got %d: %v", found, withAgent)
+	}
+	// Threaded through the shared generator with a nil provisioning image,
+	// exactly the live Windows shape (lookupVMImage returns nil there).
+	threaded := windowsMasqueradePorts(t, generateVirtualMachine(ws, nil, nil, 44787))
+	found = 0
+	for _, p := range threaded {
+		if p == 44787 {
+			found++
+		}
+	}
+	if found != 1 {
+		t.Fatalf("generateVirtualMachine must forward the explicit agent port for Windows, got %d: %v", found, threaded)
 	}
 }
