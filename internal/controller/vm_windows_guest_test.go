@@ -9,6 +9,7 @@ import (
 
 	workspacev1 "github.com/kube-workspaces/controller/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -19,6 +20,40 @@ import (
 func windowsTestWorkspace() *workspacev1.Workspace {
 	image := "registry.example/private/windows@sha256:" + strings.Repeat("a", 64)
 	return &workspacev1.Workspace{ObjectMeta: metav1.ObjectMeta{Name: "windows-test", Namespace: "test", UID: types.UID("workspace-uid")}, Spec: workspacev1.WorkspaceSpec{Type: WorkspaceTypeVM, VMProfile: &workspacev1.ResolvedVMProfile{ID: workspacev1.Windows11AMD64V1, Image: image, Generation: "generation-one", RootDiskSize: "80Gi", CPUCores: 2, GuestMemory: "4Gi", ImportSecretName: "private-import"}, Template: workspacev1.WorkspaceTemplateSpec{Spec: corev1.PodSpec{NodeSelector: map[string]string{"kubernetes.io/hostname": "worker"}, Containers: []corev1.Container{{Name: "workspace", Image: image}}}}}}
+}
+
+func TestWindowsImageSoundOptInPreservesProfileAndReconcilesRemoval(t *testing.T) {
+	ws := windowsTestWorkspace()
+	ws.Annotations = map[string]string{AnnotationStopped: "true", windowsProvisionedGeneration: ws.Spec.VMProfile.Generation}
+	baseline := generateWindowsVirtualMachine(ws, 44787)
+	for _, tc := range []struct {
+		name string
+		img  *workspacev1.Image
+		want string
+	}{
+		{"no image", nil, ""},
+		{"no opt-in", &workspacev1.Image{Spec: workspacev1.ImageSpec{Image: ws.Spec.VMProfile.Image}}, ""},
+		{"different digest", &workspacev1.Image{Spec: workspacev1.ImageSpec{Image: "registry.example/other@sha256:" + strings.Repeat("b", 64), SoundDevice: "ich9"}}, ""},
+		{"ich9 opt-in", &workspacev1.Image{Spec: workspacev1.ImageSpec{Image: ws.Spec.VMProfile.Image, SoundDevice: "ich9"}}, "ich9"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vm := baseline.DeepCopy()
+			applyWindowsImageSoundDevice(ws, vm, tc.img)
+			expected := baseline.DeepCopy()
+			if tc.want != "" {
+				_ = unstructured.SetNestedMap(expected.Object, map[string]interface{}{"name": "audiodev", "model": tc.want}, "spec", "template", "spec", "domain", "devices", "sound")
+				if !virtualMachineNeedsUpdate(vm, baseline) || !virtualMachineNeedsUpdate(baseline, vm) {
+					t.Fatal("sound addition/removal was not reconciled")
+				}
+				if virtualMachineNeedsUpdate(vm, expected) {
+					t.Fatal("sound device causes update churn")
+				}
+			}
+			if !apiequality.Semantic.DeepEqual(vm.Object, expected.Object) {
+				t.Fatal("sound opt-in changed unrelated profile/provisioning state")
+			}
+		})
+	}
 }
 
 type fakeWindowsAgent struct{ complete bool }

@@ -515,6 +515,19 @@ func windowsStatusConditions(instance *workspacev1.Workspace, status *workspacev
 	}
 }
 
+// applyWindowsImageSoundDevice applies only an explicit sound-device opt-in
+// from the exact digest-pinned catalog image. Windows bootstrap still skips
+// generic image defaults; this hardware setting does not change provisioning
+// generation, firmware, TPM, disks or the user's account.
+func applyWindowsImageSoundDevice(instance *workspacev1.Workspace, vm *unstructured.Unstructured, img *workspacev1.Image) {
+	if !windowsWorkspace(instance) || img == nil || img.Spec.SoundDevice == "" || img.Spec.Image != instance.Spec.VMProfile.Image {
+		return
+	}
+	_ = unstructured.SetNestedMap(vm.Object, map[string]interface{}{
+		"name": "audiodev", "model": img.Spec.SoundDevice,
+	}, "spec", "template", "spec", "domain", "devices", "sound")
+}
+
 func generateWindowsVirtualMachine(instance *workspacev1.Workspace, agentPort int32) *unstructured.Unstructured {
 	profile := instance.Spec.VMProfile
 	identity := windowsIdentity(instance)

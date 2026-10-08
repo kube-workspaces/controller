@@ -529,7 +529,9 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 	if err := r.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, instUnstructured); err != nil {
 		return 0, nil, err
 	}
-	desired := generateVirtualMachine(instance, img, sshKeys, agentPortForImage(agentImageForWorkspace(ctx, r.Client, instance)), instUnstructured)
+	deviceImage := agentImageForWorkspace(ctx, r.Client, instance)
+	desired := generateVirtualMachine(instance, img, sshKeys, agentPortForImage(deviceImage), instUnstructured)
+	applyWindowsImageSoundDevice(instance, desired, deviceImage)
 	if err := ctrl.SetControllerReference(instance, desired, r.Scheme); err != nil {
 		return 0, nil, err
 	}
@@ -1866,6 +1868,14 @@ func virtualMachineNeedsUpdate(desired, current *unstructured.Unstructured) bool
 		if len(d) != len(c) || !apiequality.Semantic.DeepDerivative(d, c) {
 			return true
 		}
+	}
+	// Sound is an explicit Image hardware opt-in. Removing that opt-in must
+	// remove the device too; DeepDerivative otherwise retains extra maps.
+	path := []string{"spec", "template", "spec", "domain", "devices", "sound"}
+	dSound, dFound, _ := unstructured.NestedMap(desired.Object, path...)
+	cSound, cFound, _ := unstructured.NestedMap(current.Object, path...)
+	if dFound != cFound || !apiequality.Semantic.DeepDerivative(dSound, cSound) {
+		return true
 	}
 	return false
 }
