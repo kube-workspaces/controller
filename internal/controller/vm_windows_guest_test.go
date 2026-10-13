@@ -22,6 +22,32 @@ func windowsTestWorkspace() *workspacev1.Workspace {
 	return &workspacev1.Workspace{ObjectMeta: metav1.ObjectMeta{Name: "windows-test", Namespace: "test", UID: types.UID("workspace-uid")}, Spec: workspacev1.WorkspaceSpec{Type: WorkspaceTypeVM, VMProfile: &workspacev1.ResolvedVMProfile{ID: workspacev1.Windows11AMD64V1, Image: image, Generation: "generation-one", RootDiskSize: "80Gi", CPUCores: 2, GuestMemory: "4Gi", ImportSecretName: "private-import"}, Template: workspacev1.WorkspaceTemplateSpec{Spec: corev1.PodSpec{NodeSelector: map[string]string{"kubernetes.io/hostname": "worker"}, Containers: []corev1.Container{{Name: "workspace", Image: image}}}}}}
 }
 
+func TestWindowsRemoteDesktopTransportAllowsAgentOnly(t *testing.T) {
+	rd := func(protocol string) *workspacev1.Image {
+		img := &workspacev1.Image{Spec: workspacev1.ImageSpec{Image: "registry.example/img@sha256:" + strings.Repeat("a", 64)}}
+		if protocol != "" {
+			img.Spec.RemoteDesktop = &workspacev1.ImageRemoteDesktop{Protocol: protocol, Port: 44787}
+		}
+		return img
+	}
+	for _, tc := range []struct {
+		name     string
+		protocol string
+		wantErr  bool
+	}{
+		{"no advert", "", false},
+		{"agent advert", "agent", false},
+		{"selkies advert", "selkies", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := windowsRemoteDesktopTransport(rd(tc.protocol))
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("windowsRemoteDesktopTransport(%q) err = %v, wantErr %v", tc.protocol, err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestWindowsImageSoundOptInPreservesProfileAndReconcilesRemoval(t *testing.T) {
 	ws := windowsTestWorkspace()
 	ws.Annotations = map[string]string{AnnotationStopped: "true", windowsProvisionedGeneration: ws.Spec.VMProfile.Generation}

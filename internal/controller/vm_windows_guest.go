@@ -215,6 +215,16 @@ func validateWindowsProfile(instance *workspacev1.Workspace) error {
 	return nil
 }
 
+// windowsRemoteDesktopTransport validates the Tier 1 advert on Windows
+// images. Selkies is Linux-native (X11/Wayland capture); only the
+// cross-platform kw-agent may be advertised there.
+func windowsRemoteDesktopTransport(img *workspacev1.Image) error {
+	if img.Spec.RemoteDesktop != nil && img.Spec.RemoteDesktop.Protocol != "agent" {
+		return fmt.Errorf("windows images support only the agent remote desktop transport, not %q", img.Spec.RemoteDesktop.Protocol)
+	}
+	return nil
+}
+
 // resolveWindowsProfile runs only before the first VM is created. Catalog data
 // is deliberately not consulted once a workspace has its resolved snapshot.
 func (r *WorkspaceReconciler) resolveWindowsProfile(ctx context.Context, instance *workspacev1.Workspace, img *workspacev1.Image) (bool, error) {
@@ -231,8 +241,11 @@ func (r *WorkspaceReconciler) resolveWindowsProfile(ctx context.Context, instanc
 	if img.Spec.VMProfile != workspacev1.Windows11AMD64V1 {
 		return false, fmt.Errorf("unsupported Image VM profile")
 	}
-	if !img.Spec.PersistentRootDisk || img.Spec.DefaultCloudInit || img.Spec.DefaultUserData != "" || img.Spec.RemoteDesktop != nil || img.Spec.DefaultPassword != "" {
-		return false, fmt.Errorf("windows images require persistent generalised roots, native Sysprep and no shared password or Linux guest streaming")
+	if !img.Spec.PersistentRootDisk || img.Spec.DefaultCloudInit || img.Spec.DefaultUserData != "" || img.Spec.DefaultPassword != "" {
+		return false, fmt.Errorf("windows images require persistent generalised roots, native Sysprep and no shared password")
+	}
+	if err := windowsRemoteDesktopTransport(img); err != nil {
+		return false, err
 	}
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(kubeVirtVirtualMachineGVK)

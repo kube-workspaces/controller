@@ -182,8 +182,9 @@ type ImageSpec struct {
 
 // ImageRemoteDesktop describes an in-guest remote desktop agent (Tier 1 transport).
 type ImageRemoteDesktop struct {
-	// Protocol name (e.g. "selkies").
-	// +kubebuilder:validation:Enum=selkies
+	// Protocol name: "selkies" (Linux in-guest agent) or "agent"
+	// (cross-platform kw-agent, Windows first).
+	// +kubebuilder:validation:Enum=selkies;agent
 	Protocol string `json:"protocol"`
 	// Port the agent listens on in the guest.
 	Port int32 `json:"port"`
