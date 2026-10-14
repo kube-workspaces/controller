@@ -249,16 +249,6 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	ReconcileTotal.WithLabelValues("success").Inc()
 	ReconcileDuration.Observe(time.Since(reconcileStart).Seconds())
 
-	// Track workspace status for gauge
-	_, stopped := instance.Annotations[AnnotationStopped]
-	if stopped {
-		WorkspacesTotal.WithLabelValues(instance.Namespace, "stopped").Set(1)
-	} else if readyReplicas > 0 {
-		WorkspacesTotal.WithLabelValues(instance.Namespace, "running").Set(1)
-	} else {
-		WorkspacesTotal.WithLabelValues(instance.Namespace, "starting").Set(1)
-	}
-
 	// Record ready time (time from creation to first ready state)
 	if readyReplicas > 0 && !instance.CreationTimestamp.IsZero() {
 		readyTime := time.Since(instance.CreationTimestamp.Time).Seconds()
@@ -291,6 +281,7 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 	}
 
+	_, stopped := instance.Annotations[AnnotationStopped]
 	if windowsWorkspace(instance) && !stopped && readyReplicas == 0 {
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
@@ -2012,6 +2003,9 @@ func serviceNeedsUpdate(desired, current *corev1.Service) bool {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *WorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := registerWorkspaceCounts(mgr.GetClient()); err != nil {
+		return err
+	}
 	if r.GuestAgent == nil {
 		agent, err := newWindowsGuestAgent(mgr.GetConfig())
 		if err != nil {
