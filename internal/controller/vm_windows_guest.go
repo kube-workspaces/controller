@@ -22,10 +22,13 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	workspacev1 "github.com/kube-workspaces/controller/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -290,6 +293,30 @@ func windowsHostname(instance *workspacev1.Workspace) string {
 	return fmt.Sprintf("KW-%X", sum[:6])
 }
 
+// windowsEnrollmentToken mints the clone-only agent enrollment for one
+// workspace generation: an opaque nonce bound to UID+generation with a
+// backstop expiry. Authority comes from the delivery channel
+// (controller-written via guest-exec into the agent data dir); the guest
+// validates binding/expiry locally and consumes it single-use. Rotation
+// (Reset/new lineage) is a fresh token, adopted by the agent.
+func windowsEnrollmentToken(uid, generation string, now time.Time) ([]byte, error) {
+	nonce := make([]byte, 24)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("unable to generate enrollment token")
+	}
+	token := map[string]any{
+		"token":               hex.EncodeToString(nonce),
+		"workspaceUid":        uid,
+		"workspaceGeneration": generation,
+		"expiresAt":           now.Add(7 * 24 * time.Hour).Unix(),
+	}
+	raw, err := json.Marshal(token)
+	if err != nil {
+		return nil, fmt.Errorf("unable to render enrollment token")
+	}
+	return raw, nil
+}
+
 func windowsBootstrapSecretName(instance *workspacev1.Workspace) string {
 	sum := sha256.Sum256([]byte(instance.Name + "/" + instance.Spec.VMProfile.Generation))
 	name := instance.Name
@@ -339,6 +366,22 @@ func (r *WorkspaceReconciler) reconcileWindowsBootstrap(ctx context.Context, ins
 		if len(secret.Data["password"]) == 0 || (instance.Annotations[windowsProvisionedGeneration] != instance.Spec.VMProfile.Generation && len(secret.Data["autounattend.xml"]) == 0) {
 			return fmt.Errorf("windows bootstrap Secret is incomplete")
 		}
+		// Backfill the enrollment token once for generations provisioned
+		// before it existed. Never rotate: an existing token belongs to a
+		// live enrollment flow.
+		if instance.Annotations[windowsProvisionedGeneration] != instance.Spec.VMProfile.Generation && len(secret.Data["enrollment-token.json"]) == 0 {
+			token, err := windowsEnrollmentToken(string(instance.UID), instance.Spec.VMProfile.Generation, time.Now())
+			if err != nil {
+				return err
+			}
+			if secret.Data == nil {
+				secret.Data = map[string][]byte{}
+			}
+			secret.Data["enrollment-token.json"] = token
+			if err := r.Update(ctx, secret); err != nil {
+				return err
+			}
+		}
 		return nil // Credentials must never rotate on an incidental reconcile.
 	}
 	if !apierrors.IsNotFound(err) {
@@ -356,7 +399,11 @@ func (r *WorkspaceReconciler) reconcileWindowsBootstrap(ctx context.Context, ins
 	if err != nil {
 		return fmt.Errorf("unable to render Windows bootstrap")
 	}
-	secret = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: instance.Namespace, Labels: map[string]string{"kubeworkspaces.io/windows-generation": instance.Spec.VMProfile.Generation}}, Type: corev1.SecretTypeOpaque, Data: map[string][]byte{"autounattend.xml": []byte(answer), "username": []byte("workspace"), "password": []byte(password)}}
+	token, err := windowsEnrollmentToken(string(instance.UID), instance.Spec.VMProfile.Generation, time.Now())
+	if err != nil {
+		return err
+	}
+	secret = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: instance.Namespace, Labels: map[string]string{"kubeworkspaces.io/windows-generation": instance.Spec.VMProfile.Generation}}, Type: corev1.SecretTypeOpaque, Data: map[string][]byte{"autounattend.xml": []byte(answer), "username": []byte("workspace"), "password": []byte(password), "enrollment-token.json": token}}
 	if err := ctrl.SetControllerReference(instance, secret, r.Scheme); err != nil {
 		return err
 	}
@@ -403,6 +450,23 @@ func (r *WorkspaceReconciler) resetWindowsGeneration(ctx context.Context, instan
 	return nil
 }
 
+// stageWindowsEnrollment writes this generation's enrollment token into
+// the guest agent data dir over the trusted guest-exec channel. Missing
+// token (old secrets, agent-free images) is not fatal: the guest simply
+// stays unenrolled and Tier 0. Staging is idempotent; enrollment itself
+// stays single-use inside the guest.
+func (r *WorkspaceReconciler) stageWindowsEnrollment(ctx context.Context, instance *workspacev1.Workspace, pod string) error {
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: windowsBootstrapSecretName(instance), Namespace: instance.Namespace}, secret); err != nil {
+		return err
+	}
+	token := secret.Data["enrollment-token.json"]
+	if len(token) == 0 {
+		return nil
+	}
+	return r.GuestAgent.StageEnrollment(ctx, instance.Namespace, pod, instance.Name, token)
+}
+
 // A completed guest is gracefully restarted once to physically remove its
 // bootstrap CD. Its credentials are retained separately in the owned Secret.
 func (r *WorkspaceReconciler) windowsReady(ctx context.Context, instance *workspacev1.Workspace, pod *corev1.Pod, running bool) (bool, error) {
@@ -439,6 +503,12 @@ func (r *WorkspaceReconciler) reconcileWindowsProvisioning(ctx context.Context, 
 	}
 	complete, err := r.GuestAgent.CompleteBootstrap(ctx, instance.Namespace, pod.Name, instance.Name, windowsHostname(instance))
 	if err != nil || !complete {
+		return false, err
+	}
+	// Stage the clone-only enrollment token before marking provisioned.
+	// The agent service picks it up on its initialize loop and enrolls
+	// exactly this UID+generation; without it the guest stays Tier 0.
+	if err := r.stageWindowsEnrollment(ctx, instance, pod.Name); err != nil {
 		return false, err
 	}
 	if instance.Annotations == nil {

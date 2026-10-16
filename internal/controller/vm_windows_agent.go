@@ -21,6 +21,10 @@ import (
 // No credentials are passed to exec or returned by this contract.
 type WindowsGuestAgent interface {
 	CompleteBootstrap(context.Context, string, string, string, string) (bool, error)
+	// StageEnrollment writes one generation's enrollment token into the
+	// guest agent data dir. The token authenticates nothing by itself;
+	// the guest validates its binding/expiry and consumes it single-use.
+	StageEnrollment(ctx context.Context, namespace, pod, vm string, token []byte) error
 }
 
 type windowsGuestAgent struct {
@@ -87,6 +91,58 @@ if ($complete) {
   }
 }
 @{complete=[bool]$complete} | ConvertTo-Json -Compress`, hostname)
+	output, err := a.execScript(ctx, namespace, pod, vm, script)
+	if err != nil {
+		return false, err
+	}
+	var state struct {
+		Complete bool `json:"complete"`
+	}
+	if json.Unmarshal(output, &state) != nil {
+		return false, fmt.Errorf("invalid Windows provisioning status")
+	}
+	return state.Complete, nil
+}
+
+// enrollmentStageScript renders the token write. Pure so the quoting
+// guard is unit-testable without a guest.
+func enrollmentStageScript(token []byte) (string, error) {
+	if bytes.Contains(token, []byte("'")) {
+		return "", fmt.Errorf("refusing to stage an enrollment token with quoting")
+	}
+	var parsed map[string]any
+	if json.Unmarshal(token, &parsed) != nil {
+		return "", fmt.Errorf("refusing to stage a malformed enrollment token")
+	}
+	return fmt.Sprintf(`$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'
+$dir='C:\ProgramData\workspace-agent'
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+Set-Content -Path ($dir+'\enrollment-token.json') -Value '%s' -Encoding UTF8 -NoNewline -Force
+@{staged=$true} | ConvertTo-Json -Compress`, token), nil
+}
+
+// StageEnrollment writes one generation's enrollment token into the guest
+// agent data dir. The token JSON is embedded single-quoted: the renderer
+// rejects any token containing a single quote first, so the script cannot
+// break out. PowerShell 5.1 writes UTF8 with a BOM, which the agent
+// tolerates. Nonzero exit fails provisioning; the token stays in the
+// owned Secret for the next reconcile.
+func (a *windowsGuestAgent) StageEnrollment(ctx context.Context, namespace, pod, vm string, token []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+	script, err := enrollmentStageScript(token)
+	if err != nil {
+		return err
+	}
+	if _, err := a.execScript(ctx, namespace, pod, vm, script); err != nil {
+		return fmt.Errorf("windows enrollment staging failed: %w", err)
+	}
+	return nil
+}
+
+// execScript runs a PowerShell script in the guest over the QEMU agent
+// channel and returns its parsed JSON stdout. Nonzero exit is an error.
+func (a *windowsGuestAgent) execScript(ctx context.Context, namespace, pod, vm, script string) ([]byte, error) {
 	units := utf16.Encode([]rune(script))
 	encoded := make([]byte, len(units)*2)
 	for i, unit := range units {
@@ -100,7 +156,7 @@ if ($complete) {
 		"path": `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`,
 		"arg":  []string{"-NoProfile", "-NonInteractive", "-EncodedCommand", base64.StdEncoding.EncodeToString(encoded)}, "capture-output": true,
 	}, &process); err != nil {
-		return false, err
+		return nil, err
 	}
 	for {
 		var status struct {
@@ -109,24 +165,21 @@ if ($complete) {
 			Output string `json:"out-data"`
 		}
 		if err := a.rpc(ctx, namespace, pod, domain, "guest-exec-status", map[string]interface{}{"pid": process.PID}, &status); err != nil {
-			return false, err
+			return nil, err
 		}
 		if status.Exited {
 			if status.Exit != 0 {
-				return false, fmt.Errorf("windows native setup check or bootstrap cleanup failed")
+				return nil, fmt.Errorf("windows guest script exited %d", status.Exit)
 			}
 			output, err := base64.StdEncoding.DecodeString(status.Output)
-			var state struct {
-				Complete bool `json:"complete"`
+			if err != nil {
+				return nil, fmt.Errorf("invalid Windows guest script output")
 			}
-			if err != nil || json.Unmarshal(output, &state) != nil {
-				return false, fmt.Errorf("invalid Windows provisioning status")
-			}
-			return state.Complete, nil
+			return output, nil
 		}
 		select {
 		case <-ctx.Done():
-			return false, fmt.Errorf("windows provisioning status check timed out")
+			return nil, fmt.Errorf("windows guest script timed out")
 		case <-time.After(250 * time.Millisecond):
 		}
 	}

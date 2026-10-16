@@ -2,10 +2,12 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	workspacev1 "github.com/kube-workspaces/controller/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -82,10 +84,24 @@ func TestWindowsImageSoundOptInPreservesProfileAndReconcilesRemoval(t *testing.T
 	}
 }
 
-type fakeWindowsAgent struct{ complete bool }
+type fakeWindowsAgent struct {
+	complete      bool
+	staged        [][]byte
+	stageErr      error
+	completeCalls int
+}
 
 func (a *fakeWindowsAgent) CompleteBootstrap(context.Context, string, string, string, string) (bool, error) {
+	a.completeCalls++
 	return a.complete, nil
+}
+
+func (a *fakeWindowsAgent) StageEnrollment(_ context.Context, _, _, _ string, token []byte) error {
+	if a.stageErr != nil {
+		return a.stageErr
+	}
+	a.staged = append(a.staged, append([]byte(nil), token...))
+	return nil
 }
 
 func TestWindowsNativeSetupAndPhysicalBootstrapRemoval(t *testing.T) {
@@ -347,5 +363,157 @@ func TestWindowsAnswerFileEscapingAndNoDiskWipe(t *testing.T) {
 	}
 	if strings.Contains(answer, "DiskConfiguration") || strings.Contains(answer, "AutoLogon") {
 		t.Fatal("clone bootstrap can wipe disks or automatically log in")
+	}
+}
+
+func TestWindowsEnrollmentTokenBinding(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	raw, err := windowsEnrollmentToken("workspace-uid", "generation-one", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var token struct {
+		Token        string `json:"token"`
+		WorkspaceUID string `json:"workspaceUid"`
+		Generation   string `json:"workspaceGeneration"`
+		ExpiresAt    int64  `json:"expiresAt"`
+	}
+	if err := json.Unmarshal(raw, &token); err != nil {
+		t.Fatal(err)
+	}
+	if len(token.Token) != 48 {
+		t.Fatalf("token nonce = %d hex chars, want 48", len(token.Token))
+	}
+	if token.WorkspaceUID != "workspace-uid" || token.Generation != "generation-one" {
+		t.Fatalf("token binding = %+v", token)
+	}
+	if token.ExpiresAt != now.Add(7*24*time.Hour).Unix() {
+		t.Fatalf("token expiry = %d", token.ExpiresAt)
+	}
+	again, err := windowsEnrollmentToken("workspace-uid", "generation-one", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(again) == string(raw) {
+		t.Fatal("enrollment nonces repeat")
+	}
+}
+
+func TestWindowsBootstrapSecretCarriesEnrollmentToken(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := workspacev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	ws := windowsTestWorkspace()
+	ws.Spec.VMProfile.ImportSecretName = ""
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ws).Build()
+	reconciler := WorkspaceReconciler{Client: c, Scheme: scheme}
+	ctx := context.Background()
+	if err := reconciler.reconcileWindowsBootstrap(ctx, ws); err != nil {
+		t.Fatal(err)
+	}
+	key := types.NamespacedName{Name: windowsBootstrapSecretName(ws), Namespace: ws.Namespace}
+	first := &corev1.Secret{}
+	if err := c.Get(ctx, key, first); err != nil {
+		t.Fatal(err)
+	}
+	raw := first.Data["enrollment-token.json"]
+	var token struct {
+		Token        string `json:"token"`
+		WorkspaceUID string `json:"workspaceUid"`
+		Generation   string `json:"workspaceGeneration"`
+		ExpiresAt    int64  `json:"expiresAt"`
+	}
+	if err := json.Unmarshal(raw, &token); err != nil {
+		t.Fatalf("token undecodable: %v", err)
+	}
+	if token.WorkspaceUID != string(ws.UID) || token.Generation != ws.Spec.VMProfile.Generation {
+		t.Fatalf("token binding = %+v, want this workspace/generation", token)
+	}
+	if token.ExpiresAt <= time.Now().Unix() {
+		t.Fatal("token already expired at mint")
+	}
+	// A second reconcile backfills nothing and rotates nothing.
+	if err := reconciler.reconcileWindowsBootstrap(ctx, ws); err != nil {
+		t.Fatal(err)
+	}
+	second := &corev1.Secret{}
+	if err := c.Get(ctx, key, second); err != nil {
+		t.Fatal(err)
+	}
+	if string(second.Data["enrollment-token.json"]) != string(raw) {
+		t.Fatal("enrollment token rotated on reconcile")
+	}
+	// A legacy secret without a token gets exactly one backfill.
+	delete(second.Data, "enrollment-token.json")
+	if err := c.Update(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.reconcileWindowsBootstrap(ctx, ws); err != nil {
+		t.Fatal(err)
+	}
+	backfilled := &corev1.Secret{}
+	if err := c.Get(ctx, key, backfilled); err != nil {
+		t.Fatal(err)
+	}
+	if len(backfilled.Data["enrollment-token.json"]) == 0 {
+		t.Fatal("missing token not backfilled")
+	}
+}
+
+func TestEnrollmentStageScriptGuardsQuoting(t *testing.T) {
+	good, err := enrollmentStageScript([]byte(`{"token":"abc"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(good, "enrollment-token.json") || !strings.Contains(good, `{"token":"abc"}`) {
+		t.Fatalf("stage script = %q", good)
+	}
+	if _, err := enrollmentStageScript([]byte(`{"token":"a'b"}`)); err == nil {
+		t.Fatal("quoting token accepted")
+	}
+	if _, err := enrollmentStageScript([]byte(`not json`)); err == nil {
+		t.Fatal("malformed token accepted")
+	}
+}
+
+func TestWindowsProvisioningStagesEnrollment(t *testing.T) {
+	scheme := resetTestScheme(t)
+	ws := windowsTestWorkspace()
+	ws.Spec.VMProfile.ImportSecretName = ""
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ws).Build()
+	agent := &fakeWindowsAgent{complete: true}
+	r := &WorkspaceReconciler{Client: c, Scheme: scheme, GuestAgent: agent}
+	ctx := context.Background()
+	if err := r.reconcileWindowsBootstrap(ctx, ws); err != nil {
+		t.Fatal(err)
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "launcher", Namespace: ws.Namespace, UID: types.UID("active-pod")}}
+	vmi := &unstructured.Unstructured{}
+	vmi.SetGroupVersionKind(kubeVirtVirtualMachineInstanceGVK)
+	vmi.SetName(ws.Name)
+	vmi.SetNamespace(ws.Namespace)
+	if err := unstructured.SetNestedStringMap(vmi.Object, map[string]string{string(pod.UID): ""}, "status", "activePods"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(ctx, vmi); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.reconcileWindowsProvisioning(ctx, ws, pod); err != nil {
+		t.Fatal(err)
+	}
+	if len(agent.staged) != 1 {
+		t.Fatalf("staged calls = %d, want 1", len(agent.staged))
+	}
+	name := types.NamespacedName{Name: windowsBootstrapSecretName(ws), Namespace: ws.Namespace}
+	secret := &corev1.Secret{}
+	if err := c.Get(ctx, name, secret); err != nil {
+		t.Fatal(err)
+	}
+	if string(agent.staged[0]) != string(secret.Data["enrollment-token.json"]) {
+		t.Fatal("staged token differs from the owned secret")
 	}
 }
