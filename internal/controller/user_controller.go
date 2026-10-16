@@ -19,12 +19,14 @@ package controller
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -160,17 +162,19 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		nsName := renderNamespaceTemplate(authConfig.Spec.PersonalNamespaces.Template, user.Name)
 		user.Status.PersonalNamespace = nsName
 	}
-	meta := metav1.Now()
+	previousStatus := user.DeepCopy().Status
 	readyCondition := metav1.Condition{
 		Type:               "Ready",
 		Status:             metav1.ConditionTrue,
-		LastTransitionTime: meta,
+		LastTransitionTime: metav1.Now(),
 		Reason:             "Reconciled",
 		Message:            "User resources are in sync",
 	}
 	setCondition(&user.Status.Conditions, readyCondition)
-	if err := r.Status().Update(ctx, &user); err != nil {
-		return ctrl.Result{}, err
+	if !reflect.DeepEqual(previousStatus, user.Status) {
+		if err := r.Status().Update(ctx, &user); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	return ctrl.Result{}, nil
@@ -271,6 +275,21 @@ func (r *UserReconciler) ensureRoleBinding(ctx context.Context, user *kubeworksp
 			Namespace: namespace,
 		},
 	}
+	// Kubernetes does not allow roleRef updates. Remove the old grant before
+	// recreating it so a downgrade cannot leave elevated access behind.
+	if err := r.Get(ctx, client.ObjectKeyFromObject(rb), rb); err != nil && !errors.IsNotFound(err) {
+		return err
+	}
+	desiredRoleRef := rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: clusterRole}
+	if rb.ResourceVersion != "" && rb.RoleRef != desiredRoleRef {
+		if rb.Labels[LabelManagedByUser] != ManagedByValue || rb.Labels[LabelUserName] != user.Name {
+			return fmt.Errorf("refusing to replace unmanaged RoleBinding %s/%s", namespace, rbName)
+		}
+		if err := r.Delete(ctx, rb, client.Preconditions{UID: &rb.UID, ResourceVersion: &rb.ResourceVersion}); err != nil && !errors.IsNotFound(err) {
+			return err
+		}
+	}
+	rb = &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: rbName, Namespace: namespace}}
 
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, rb, func() error {
 		if rb.Labels == nil {
@@ -317,7 +336,11 @@ func (r *UserReconciler) ensureResourceQuota(ctx context.Context, user *kubework
 
 		hard := make(corev1.ResourceList)
 		for k, v := range quotaSpec {
-			hard[corev1.ResourceName(k)] = resource.MustParse(v)
+			quantity, err := resource.ParseQuantity(v)
+			if err != nil {
+				return fmt.Errorf("invalid resource quota %q value %q: %w", k, v, err)
+			}
+			hard[corev1.ResourceName(k)] = quantity
 		}
 		rq.Spec.Hard = hard
 		return nil
@@ -358,8 +381,6 @@ func (r *UserReconciler) cleanupStaleRoleBindings(ctx context.Context, user *kub
 }
 
 func (r *UserReconciler) cleanupUser(ctx context.Context, user *kubeworkspacesiov1alpha1.User) error {
-	log := logf.FromContext(ctx)
-
 	// Remove all RoleBindings managed by this user
 	var rbList rbacv1.RoleBindingList
 	if err := r.List(ctx, &rbList, client.MatchingLabels{
@@ -370,7 +391,7 @@ func (r *UserReconciler) cleanupUser(ctx context.Context, user *kubeworkspacesio
 	}
 	for i := range rbList.Items {
 		if err := r.Delete(ctx, &rbList.Items[i]); err != nil && !errors.IsNotFound(err) {
-			log.Error(err, "failed to delete RoleBinding", "name", rbList.Items[i].Name)
+			return fmt.Errorf("failed to delete RoleBinding %s/%s: %w", rbList.Items[i].Namespace, rbList.Items[i].Name, err)
 		}
 	}
 
@@ -382,7 +403,7 @@ func (r *UserReconciler) cleanupUser(ctx context.Context, user *kubeworkspacesio
 			},
 		}
 		if err := r.Delete(ctx, ns); err != nil && !errors.IsNotFound(err) {
-			log.Error(err, "failed to delete personal namespace", "namespace", user.Status.PersonalNamespace)
+			return fmt.Errorf("failed to delete personal namespace %s: %w", user.Status.PersonalNamespace, err)
 		}
 	}
 
@@ -422,11 +443,5 @@ func setCondition(conditions *[]metav1.Condition, condition metav1.Condition) {
 	if conditions == nil {
 		return
 	}
-	for i, c := range *conditions {
-		if c.Type == condition.Type {
-			(*conditions)[i] = condition
-			return
-		}
-	}
-	*conditions = append(*conditions, condition)
+	meta.SetStatusCondition(conditions, condition)
 }

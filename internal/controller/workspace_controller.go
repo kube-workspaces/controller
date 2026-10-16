@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"reflect"
@@ -63,6 +64,9 @@ const (
 	DefaultGuestMemory = "2Gi"
 	// AnnotationStopped is the annotation that indicates a workspace is stopped
 	AnnotationStopped = "kubeworkspaces.io/stopped"
+	// AnnotationPodTemplateHash tracks desired fields, including removals, while
+	// comparison against live templates tolerates API-server defaulting.
+	AnnotationPodTemplateHash = "kubeworkspaces.io/pod-template-hash"
 	// AnnotationReset is the annotation that requests a reset (re-provisioning
 	// the workspace from its image, giving it a fresh root volume). The API
 	// stamps it with a timestamp so every reset is unique.
@@ -389,7 +393,8 @@ func (r *WorkspaceReconciler) reconcileStatefulSet(ctx context.Context, instance
 		// containers slice drops volumes/initContainers added by the API (e.g.
 		// the dshm shared-memory volume), leaving volumeMounts pointing at
 		// volumes the StatefulSet no longer has.
-		foundStateful.Spec.Template.Spec = ss.Spec.Template.Spec
+		foundStateful.Spec.Template = ss.Spec.Template
+		setPodTemplateHash(foundStateful, &ss.Spec.Template)
 		if err := r.Update(ctx, foundStateful); err != nil {
 			log.Error(err, "unable to update StatefulSet")
 			return 0, nil, err
@@ -433,9 +438,8 @@ func (r *WorkspaceReconciler) reconcileDeployment(ctx context.Context, instance 
 	if !justCreated && deploymentNeedsUpdate(dep, found) {
 		log.Info("Updating Deployment", "namespace", dep.Namespace, "name", dep.Name)
 		found.Spec.Replicas = dep.Spec.Replicas
-		found.Spec.Template.Spec.Containers = dep.Spec.Template.Spec.Containers
-		found.Spec.Template.Spec.InitContainers = dep.Spec.Template.Spec.InitContainers
-		found.Spec.Template.Spec.Volumes = dep.Spec.Template.Spec.Volumes
+		found.Spec.Template = dep.Spec.Template
+		setPodTemplateHash(found, &dep.Spec.Template)
 		if err := r.Update(ctx, found); err != nil {
 			log.Error(err, "unable to update Deployment")
 			return 0, nil, err
@@ -957,17 +961,8 @@ func podCondToWorkspaceCondition(podc corev1.PodCondition) kubeworkspacesiov1alp
 		condition.Reason = podc.Reason
 	}
 
-	if !podc.LastProbeTime.Time.Equal(time.Time{}) {
-		condition.LastProbeTime = podc.LastProbeTime
-	} else {
-		condition.LastProbeTime = metav1.Now()
-	}
-
-	if !podc.LastTransitionTime.Time.Equal(time.Time{}) {
-		condition.LastTransitionTime = podc.LastTransitionTime
-	} else {
-		condition.LastTransitionTime = metav1.Now()
-	}
+	condition.LastProbeTime = podc.LastProbeTime
+	condition.LastTransitionTime = podc.LastTransitionTime
 
 	return condition
 }
@@ -1031,6 +1026,7 @@ func generateStatefulSet(instance *kubeworkspacesiov1alpha1.Workspace) *appsv1.S
 		}
 	}
 
+	setPodTemplateHash(ss, &ss.Spec.Template)
 	return ss
 }
 
@@ -1091,6 +1087,7 @@ func generateDeployment(instance *kubeworkspacesiov1alpha1.Workspace) *appsv1.De
 		}
 	}
 
+	setPodTemplateHash(dep, &dep.Spec.Template)
 	return dep
 }
 
@@ -1871,24 +1868,32 @@ func virtualMachineNeedsUpdate(desired, current *unstructured.Unstructured) bool
 	return false
 }
 
-// deploymentNeedsUpdate compares replicas, containers, init containers, volumes.
-// Uses apimachinery's Semantic (DeepDerivative-style) comparison, which treats
-// API-server-defaulted empty maps (e.g. resources: {}) as equal to absent ones,
-// avoiding a hot update loop.
+// deploymentNeedsUpdate compares replicas and the complete desired pod template.
 func deploymentNeedsUpdate(desired, current *appsv1.Deployment) bool {
 	if *desired.Spec.Replicas != *current.Spec.Replicas {
 		return true
 	}
-	if !apiequality.Semantic.DeepEqual(desired.Spec.Template.Spec.Containers, current.Spec.Template.Spec.Containers) {
-		return true
+	return podTemplateNeedsUpdate(desired, current, &desired.Spec.Template, &current.Spec.Template)
+}
+
+func setPodTemplateHash(object client.Object, template *corev1.PodTemplateSpec) {
+	// PodTemplateSpec contains only JSON-marshalable Kubernetes API fields.
+	data, _ := json.Marshal(template)
+	annotations := object.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
 	}
-	if !apiequality.Semantic.DeepEqual(desired.Spec.Template.Spec.InitContainers, current.Spec.Template.Spec.InitContainers) {
-		return true
-	}
-	if !apiequality.Semantic.DeepEqual(desired.Spec.Template.Spec.Volumes, current.Spec.Template.Spec.Volumes) {
-		return true
-	}
-	return false
+	annotations[AnnotationPodTemplateHash] = fmt.Sprintf("%x", sha256.Sum256(data))
+	object.SetAnnotations(annotations)
+}
+
+func podTemplateNeedsUpdate(desired, current client.Object, desiredTemplate, currentTemplate *corev1.PodTemplateSpec) bool {
+	// The fingerprint detects removed fields that DeepDerivative intentionally
+	// ignores. The derivative comparison detects drift in explicitly set fields
+	// without treating API defaults as changes. Existing workloads acquire the
+	// fingerprint on their next reconciliation.
+	return desired.GetAnnotations()[AnnotationPodTemplateHash] != current.GetAnnotations()[AnnotationPodTemplateHash] ||
+		!apiequality.Semantic.DeepDerivative(desiredTemplate, currentTemplate)
 }
 
 // generateService creates the desired Service for a Workspace.
@@ -1969,25 +1974,12 @@ func generateService(instance *kubeworkspacesiov1alpha1.Workspace, wsType string
 }
 
 // statefulSetNeedsUpdate checks if the StatefulSet needs to be updated.
-// We compare replicas, containers, init containers, volumes, and security context.
-// Uses apimachinery semantic equality to tolerate API-server-defaulted fields.
+// We compare replicas and the complete desired pod template.
 func statefulSetNeedsUpdate(desired, current *appsv1.StatefulSet) bool {
 	if *desired.Spec.Replicas != *current.Spec.Replicas {
 		return true
 	}
-	if !apiequality.Semantic.DeepEqual(desired.Spec.Template.Spec.Containers, current.Spec.Template.Spec.Containers) {
-		return true
-	}
-	if !apiequality.Semantic.DeepEqual(desired.Spec.Template.Spec.InitContainers, current.Spec.Template.Spec.InitContainers) {
-		return true
-	}
-	if !apiequality.Semantic.DeepEqual(desired.Spec.Template.Spec.Volumes, current.Spec.Template.Spec.Volumes) {
-		return true
-	}
-	if !apiequality.Semantic.DeepEqual(desired.Spec.Template.Spec.SecurityContext, current.Spec.Template.Spec.SecurityContext) {
-		return true
-	}
-	return false
+	return podTemplateNeedsUpdate(desired, current, &desired.Spec.Template, &current.Spec.Template)
 }
 
 // serviceNeedsUpdate checks if the Service needs to be updated.

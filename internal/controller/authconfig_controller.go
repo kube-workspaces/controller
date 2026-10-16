@@ -21,6 +21,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"reflect"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -31,6 +32,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	kubeworkspacesiov1alpha1 "github.com/kube-workspaces/controller/api/v1alpha1"
 )
@@ -67,6 +69,13 @@ func (r *AuthConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	// Update status.enabled to reflect spec
+	previousStatus := authConfig.DeepCopy().Status
+	updateStatus := func() error {
+		if reflect.DeepEqual(previousStatus, authConfig.Status) {
+			return nil
+		}
+		return r.Status().Update(ctx, &authConfig)
+	}
 	authConfig.Status.Enabled = authConfig.Spec.Enabled
 
 	// If auth is not enabled, just update status and return
@@ -79,7 +88,7 @@ func (r *AuthConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			Message:            "Authentication is disabled",
 		}
 		setCondition(&authConfig.Status.Conditions, condition)
-		if err := r.Status().Update(ctx, &authConfig); err != nil {
+		if err := updateStatus(); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
@@ -97,7 +106,7 @@ func (r *AuthConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			Message:            "Either OIDC or localAuth must be configured when auth is enabled",
 		}
 		setCondition(&authConfig.Status.Conditions, condition)
-		if err := r.Status().Update(ctx, &authConfig); err != nil {
+		if err := updateStatus(); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
@@ -123,7 +132,7 @@ func (r *AuthConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			Message:            "Authentication is enabled via local auth (no OIDC configured)",
 		}
 		setCondition(&authConfig.Status.Conditions, condition)
-		if err := r.Status().Update(ctx, &authConfig); err != nil {
+		if err := updateStatus(); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
@@ -155,7 +164,7 @@ func (r *AuthConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		setCondition(&authConfig.Status.Conditions, condition)
 	}
 
-	if err := r.Status().Update(ctx, &authConfig); err != nil {
+	if err := updateStatus(); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -196,5 +205,8 @@ func (r *AuthConfigReconciler) verifyIssuer(ctx context.Context, issuerURL strin
 func (r *AuthConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&kubeworkspacesiov1alpha1.AuthConfig{}).
+		// LastVerified intentionally changes on each periodic issuer check. Do
+		// not let that status write immediately trigger another issuer check.
+		WithEventFilter(predicate.GenerationChangedPredicate{}).
 		Complete(r)
 }

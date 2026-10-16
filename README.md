@@ -82,6 +82,12 @@ The reconciler switches on `spec.type`:
 5. Update workspace status from pod/VMI state
 6. Ensure default container port if not specified (default: 8080)
 
+For `container` and `scratch` workspaces, updates reconcile the complete pod
+template, including scheduling, service account, security settings, labels, and
+annotations. A controller-managed `kubeworkspaces.io/pod-template-hash` annotation
+on the workload tracks desired changes and removals while tolerating API defaults.
+Scheduling changes take effect when replacement pods are scheduled.
+
 `SshKey` create/update/delete events reconcile all VMs in the same namespace.
 Images with `kubeworkspaces.io/ssh-key-propagation: qemuGuestAgent` in metadata
 annotations and a `defaultUser` use a Workspace-owned SSH-key Secret and native
@@ -90,6 +96,17 @@ KubeVirt guest-agent propagation. This manages the user's whole
 `qemu-guest-agent`. Existing VMs need one restart to attach the Secret, then key
 changes apply live without VM-template changes. No restart is forced. Other
 images use first-boot cloud-init seeding (`runcmd` is not a per-boot module).
+
+### User resources and status
+
+The User controller manages personal namespaces, optional ResourceQuotas, and
+namespace RoleBindings. Role changes replace the binding because Kubernetes
+`roleRef` is immutable. Failed cleanup requests retain the User finalizer and are
+retried. Invalid quota quantities return an error identifying the offending key.
+
+Unchanged status is not rewritten. User and AuthConfig condition transition
+timestamps change only when the condition status changes. OIDC issuer checks run
+periodically; AuthConfig status updates do not trigger another immediate check.
 
 ## Development
 
@@ -105,7 +122,19 @@ make install
 
 # Run controller locally
 make run
+
+# Run unit and envtest integration tests (downloads envtest binaries)
+make test
+
+# Run lint checks
+make lint
 ```
+
+The tests cover workspace creation, Service selectors and ownership,
+start/stop/restart, pod-template updates and removals, reconciliation idempotency,
+RoleBinding role changes, cleanup retries, and malformed quota quantities.
+Envtest runs a local API server; it does not start workloads or run Kubernetes
+garbage collection. Use `make test-e2e` for the kind-based end-to-end suite.
 
 ## Docker
 
