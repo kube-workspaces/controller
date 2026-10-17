@@ -39,6 +39,46 @@ type NamespaceAccessEntry struct {
 	Role UserRole `json:"role"`
 }
 
+// ExecutionPermission is an independently delegated VM management ability.
+// +kubebuilder:validation:Enum=workspace.exec;workspace.shell;workspace.exec.elevated;workspace.execution.manage;workspace.execution.recordings.read
+type ExecutionPermission string
+
+const (
+	ExecutionPermissionExec           ExecutionPermission = "workspace.exec"
+	ExecutionPermissionShell          ExecutionPermission = "workspace.shell"
+	ExecutionPermissionElevated       ExecutionPermission = "workspace.exec.elevated"
+	ExecutionPermissionManage         ExecutionPermission = "workspace.execution.manage"
+	ExecutionPermissionReadRecordings ExecutionPermission = "workspace.execution.recordings.read"
+)
+
+// ExecutionGrant delegates abilities within existing namespace/workspace access.
+// It never creates namespace access or permits the recipient to delegate onward.
+type ExecutionGrant struct {
+	// Namespace is the exact namespace; wildcard grants are not supported.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Namespace string `json:"namespace"`
+	// Workspaces optionally narrows the grant to exact Workspace names.
+	// Omit to cover accessible workspaces throughout Namespace.
+	// +optional
+	// +kubebuilder:validation:MaxItems=100
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=253
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +listType=set
+	Workspaces []string `json:"workspaces,omitempty"`
+	// Permissions are additive; elevation alone never permits exec or shell.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=5
+	// +listType=set
+	Permissions []ExecutionPermission `json:"permissions"`
+	// ExpiresAt is the exclusive expiry bound; omitted means no grant expiry.
+	// Active executions must still renew short-lived authorization leases.
+	// +optional
+	ExpiresAt *metav1.Time `json:"expiresAt,omitempty"`
+}
+
 // LocalAuthSpec defines local (username/password) authentication for a user.
 type LocalAuthSpec struct {
 	// Enabled controls whether this user may authenticate with a local password,
@@ -76,6 +116,11 @@ type UserSpec struct {
 	// NamespaceAccess defines additional shared namespace grants beyond the personal namespace.
 	// +optional
 	NamespaceAccess []NamespaceAccessEntry `json:"namespaceAccess,omitempty"`
+	// ExecutionGrants are administrator-managed, scoped VM execution abilities.
+	// Empty grants give non-admin users no execution, elevation or recording rights.
+	// +optional
+	// +kubebuilder:validation:MaxItems=100
+	ExecutionGrants []ExecutionGrant `json:"executionGrants,omitempty"`
 	// LocalAuth configures local username/password authentication for this user.
 	// May be set alongside other authentication methods (e.g. OIDC) for the same identity.
 	// +optional

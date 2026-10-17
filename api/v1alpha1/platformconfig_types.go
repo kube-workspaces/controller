@@ -53,6 +53,19 @@ type PlatformFormConfig struct {
 	LockedFields []PlatformFormFieldLock `json:"lockedFields,omitempty"`
 }
 
+// VMExecutionPolicy controls agent-backed machine management. Full protected
+// recording and authenticated guest admission are mandatory, not policy toggles.
+type VMExecutionPolicy struct {
+	// Enabled permits admission only when transport, recording and guest identity
+	// prerequisites are healthy. Absent/false disables execution even for admins.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+	// AllowElevated permits separately authorized root/SYSTEM targets.
+	// Absent/false denies elevated targets even for admins.
+	// +optional
+	AllowElevated bool `json:"allowElevated,omitempty"`
+}
+
 // PlatformConfigSpec defines the desired state of PlatformConfig.
 type PlatformConfigSpec struct {
 	// Maintenance configures maintenance mode for the platform.
@@ -61,6 +74,9 @@ type PlatformConfigSpec struct {
 	// Form configures workspace creation form behavior including field locking.
 	// +optional
 	Form *PlatformFormConfig `json:"form,omitempty"`
+	// VMExecution configures opt-in agent-backed VM commands and shells.
+	// +optional
+	VMExecution *VMExecutionPolicy `json:"vmExecution,omitempty"`
 }
 
 // PlatformConfigStatus defines the observed state of PlatformConfig.
