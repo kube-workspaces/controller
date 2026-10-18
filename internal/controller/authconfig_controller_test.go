@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	kubeworkspacesiov1alpha1 "github.com/kube-workspaces/controller/api/v1alpha1"
@@ -149,6 +150,60 @@ var _ = Describe("AuthConfig Controller", func() {
 	})
 
 	Context("When auth is enabled with only localAuth configured (no OIDC)", func() {
+		DescribeTable("should preserve bootstrap password-change defaults and explicit values",
+			func(option *bool, expected bool) {
+				authConfig := &kubeworkspacesiov1alpha1.AuthConfig{
+					ObjectMeta: metav1.ObjectMeta{Name: authConfigName},
+					Spec: kubeworkspacesiov1alpha1.AuthConfigSpec{
+						Enabled: true,
+						LocalAuth: &kubeworkspacesiov1alpha1.LocalAuthConfig{
+							Enabled: true,
+							BootstrapAdmin: &kubeworkspacesiov1alpha1.BootstrapAdminConfig{
+								MustChangePassword: option,
+							},
+						},
+					},
+				}
+				Expect(k8sClient.Create(ctx, authConfig)).To(Succeed())
+				stored := &kubeworkspacesiov1alpha1.AuthConfig{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: authConfigName}, stored)).To(Succeed())
+				Expect(stored.Spec.LocalAuth.BootstrapAdmin.MustChangePassword).NotTo(BeNil())
+				Expect(*stored.Spec.LocalAuth.BootstrapAdmin.MustChangePassword).To(Equal(expected))
+
+				userKey := types.NamespacedName{Name: "admin-at-local"}
+				secretKey := types.NamespacedName{Name: "kw-user-admin-at-local-local-auth", Namespace: LocalAuthSystemNamespace}
+				DeferCleanup(func() {
+					user := &kubeworkspacesiov1alpha1.User{}
+					if k8sClient.Get(ctx, userKey, user) == nil {
+						Expect(k8sClient.Delete(ctx, user)).To(Succeed())
+					}
+					secret := &corev1.Secret{}
+					if k8sClient.Get(ctx, secretKey, secret) == nil {
+						Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
+					}
+				})
+				// Creation and re-bootstrap must both apply the configured value.
+				for i := 0; i < 2; i++ {
+					_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: authConfigName}})
+					Expect(err).NotTo(HaveOccurred())
+					user := &kubeworkspacesiov1alpha1.User{}
+					Expect(k8sClient.Get(ctx, userKey, user)).To(Succeed())
+					Expect(user.Spec.LocalAuth.MustChangePassword).To(Equal(expected))
+					// Bootstrap configuration must not rewrite an existing User's policy.
+					user.Spec.LocalAuth.MustChangePassword = !expected
+					Expect(k8sClient.Update(ctx, user)).To(Succeed())
+					_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: authConfigName}})
+					Expect(err).NotTo(HaveOccurred())
+					Expect(k8sClient.Get(ctx, userKey, user)).To(Succeed())
+					Expect(user.Spec.LocalAuth.MustChangePassword).To(Equal(!expected))
+					Expect(k8sClient.Delete(ctx, user)).To(Succeed())
+				}
+			},
+			Entry("omitted defaults to true", nil, true),
+			Entry("explicit true", ptr.To(true), true),
+			Entry("explicit false", ptr.To(false), false),
+		)
+
 		It("should set Ready condition to True with LocalAuthOnly reason and create the bootstrap admin", func() {
 			authConfig := &kubeworkspacesiov1alpha1.AuthConfig{
 				ObjectMeta: metav1.ObjectMeta{

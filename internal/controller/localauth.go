@@ -159,8 +159,12 @@ func (r *AuthConfigReconciler) reconcileBootstrapAdmin(ctx context.Context, auth
 	}
 
 	email := DefaultBootstrapAdminEmail
+	mustChangePassword := true
 	if localAuth.BootstrapAdmin != nil && localAuth.BootstrapAdmin.Email != "" {
 		email = localAuth.BootstrapAdmin.Email
+	}
+	if localAuth.BootstrapAdmin != nil && localAuth.BootstrapAdmin.MustChangePassword != nil {
+		mustChangePassword = *localAuth.BootstrapAdmin.MustChangePassword
 	}
 
 	// Skip if any local-auth-enabled user already exists (covers the case where
@@ -212,7 +216,7 @@ func (r *AuthConfigReconciler) reconcileBootstrapAdmin(ctx context.Context, auth
 			LocalAuth: &kubeworkspacesiov1alpha1.LocalAuthSpec{
 				Enabled:            true,
 				PasswordSecretRef:  ref,
-				MustChangePassword: true,
+				MustChangePassword: mustChangePassword,
 			},
 		},
 	}

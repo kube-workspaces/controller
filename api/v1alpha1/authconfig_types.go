@@ -133,6 +133,11 @@ type BootstrapAdminConfig struct {
 	// admin user has already been provisioned manually.
 	// +optional
 	Skip bool `json:"skip,omitempty"`
+	// MustChangePassword requires a password change on the bootstrap admin's
+	// first login. Defaults to true; only applies when creating a new User.
+	// +optional
+	// +kubebuilder:default=true
+	MustChangePassword *bool `json:"mustChangePassword,omitempty"`
 }
 
 // LocalAuthConfig defines local (username/password) authentication behavior.
