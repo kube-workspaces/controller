@@ -118,6 +118,9 @@ type WorkspaceReconciler struct {
 	// not watch (e.g. Image CRs read for cloud-init seeding).
 	APIReader  client.Reader
 	GuestAgent WindowsGuestAgent
+	// ManagementBootstrapNamespace is an opt-in protected control-plane namespace.
+	// Empty disables management credential provisioning entirely.
+	ManagementBootstrapNamespace string
 }
 
 // +kubebuilder:rbac:groups=kubeworkspaces.io,resources=images,verbs=get;list;watch;create
@@ -593,6 +596,13 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 
 	var readyReplicas int32
 	if pod != nil && podReady(pod) && vmiReady {
+		managementVM := found
+		if justCreated {
+			managementVM = desired
+		}
+		if err := r.reconcileManagementBootstrap(ctx, instance, managementVM); err != nil {
+			return 0, pod, err
+		}
 		readyReplicas = 1
 	}
 	return readyReplicas, pod, nil

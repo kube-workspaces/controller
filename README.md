@@ -183,3 +183,33 @@ with `compare-rbac.py`.
 ## License
 
 Apache License 2.0
+## Management bootstrap provisioning (opt-in foundation)
+
+`--management-bootstrap-namespace=<protected-control-plane-namespace>` (or
+`KW_MANAGEMENT_BOOTSTRAP_NAMESPACE`) opts into management-only bootstrap Secret
+provisioning. Empty is the default and disables it. The namespace must already
+exist, be protected from tenant Secret access, and differ from the workspace
+namespace. This does not start a management listener, issue certificates, stage
+credentials into guests or authorize execution.
+
+For a ready, currently owned VM, the controller re-reads Workspace/VM identity
+through its uncached API reader and creates one immutable Opaque Secret in that
+protected namespace. Its name is `kw-mgmt-` plus the first 16 bytes of SHA-256 of
+`workspaceUID/virtualMachineUID`, encoded as lowercase hex. `bootstrap.json` is a
+versioned per-VM document with a random 256-bit base64url token, exact workspace
+scope/UID, the VirtualMachine UID as management generation, initial epoch zero
+and a 15-minute expiry. Source identity, labels and payload must agree; a
+conflicting existing Secret is never adopted or overwritten.
+
+Reset/recreation changes the VM UID; ordinary VMI reboot preserves it. Pending
+reset/stop/reboot/deletion states deny provisioning. Windows profile provisioning
+must also be complete and consistent. Management identity is separate from the
+existing desktop enrollment/profile generation and token file.
+
+Reconciliation never automatically refreshes an expired credential or turns a
+redeemed token into a renewal credential. Registration and single-CSR redemption
+belong to the API shared enrollment ledger. Renewal/key rotation and protected
+guest delivery remain separate integration work. There is no cross-namespace
+owner reference: privileged cleanup/rotation must account for these Secrets;
+deleting one alone does not revoke an already issued certificate. Reset/current
+identity verification and certificate expiry fence old identities.

@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -98,6 +99,10 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
+	var managementBootstrapNamespace string
+	flag.StringVar(&managementBootstrapNamespace, "management-bootstrap-namespace",
+		os.Getenv("KW_MANAGEMENT_BOOTSTRAP_NAMESPACE"),
+		"Protected namespace for opt-in management bootstrap Secrets; empty disables provisioning")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or set to 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -128,6 +133,10 @@ func main() {
 	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	if managementBootstrapNamespace != "" && len(validation.IsDNS1123Label(managementBootstrapNamespace)) != 0 {
+		setupLog.Error(fmt.Errorf("invalid namespace"), "management bootstrap namespace must be a DNS label")
+		os.Exit(1)
+	}
 
 	// Log the build up front, so a pod can be identified from its logs alone
 	// without inspecting the image digest.
@@ -254,10 +263,11 @@ func main() {
 	}
 
 	if err := (&controller.WorkspaceReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		EventRecorder: mgr.GetEventRecorderFor("workspace-controller"),
-		APIReader:     mgr.GetAPIReader(),
+		Client:                       mgr.GetClient(),
+		Scheme:                       mgr.GetScheme(),
+		EventRecorder:                mgr.GetEventRecorderFor("workspace-controller"),
+		APIReader:                    mgr.GetAPIReader(),
+		ManagementBootstrapNamespace: managementBootstrapNamespace,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Workspace")
 		os.Exit(1)
