@@ -66,6 +66,18 @@ type VMExecutionPolicy struct {
 	AllowElevated bool `json:"allowElevated,omitempty"`
 }
 
+// AgentUpgradePolicy controls durable agent-upgrade admission. Artifact
+// verification, guest dispatch and fresh installed inventory are mandatory
+// prerequisites, not policy toggles. Absent/false keeps the upgrade surface
+// disabled even for administrators.
+type AgentUpgradePolicy struct {
+	// Enabled admits administrator-only durable upgrade attempts when storage,
+	// eligibility and reservation prerequisites are healthy.
+	// Absent/false disables agent upgrades entirely.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+}
+
 // PlatformConfigSpec defines the desired state of PlatformConfig.
 type PlatformConfigSpec struct {
 	// Maintenance configures maintenance mode for the platform.
@@ -77,6 +89,10 @@ type PlatformConfigSpec struct {
 	// VMExecution configures opt-in agent-backed VM commands and shells.
 	// +optional
 	VMExecution *VMExecutionPolicy `json:"vmExecution,omitempty"`
+	// AgentUpgrades configures the administrator-only durable agent-upgrade
+	// admission surface. Absent/false keeps agent upgrades disabled.
+	// +optional
+	AgentUpgrades *AgentUpgradePolicy `json:"agentUpgrades,omitempty"`
 }
 
 // PlatformConfigStatus defines the observed state of PlatformConfig.
