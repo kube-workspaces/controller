@@ -5,11 +5,45 @@ import (
 	. "github.com/onsi/gomega"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha1 "github.com/kube-workspaces/controller/api/v1alpha1"
 )
 
 var _ = Describe("VM execution grant admission schema", func() {
+	It("persists controller execution epochs and rejects rollback or removal", func() {
+		ws := testWorkspace(WorkspaceTypeVM, nil)
+		ws.Name = ""
+		ws.GenerateName = "execution-epoch-"
+		ws.Namespace = "default"
+		Expect(k8sClient.Create(ctx, ws)).To(Succeed())
+		DeferCleanup(func() { Expect(k8sClient.Delete(ctx, ws)).To(Succeed()) })
+		// Revocation requests must also be monotonic: removing a request
+		// before the controller acknowledges it must not re-enable old grants.
+		ws.Spec.ExecutionRevocationEpoch = 3
+		Expect(k8sClient.Update(ctx, ws)).To(Succeed())
+		for _, epoch := range []int64{2, 0, -1} {
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ws), ws)).To(Succeed())
+			ws.Spec.ExecutionRevocationEpoch = epoch
+			Expect(apierrors.IsInvalid(k8sClient.Update(ctx, ws))).To(BeTrue())
+		}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ws), ws)).To(Succeed())
+		ws.Status.ManagementExecution = &v1alpha1.ManagementExecutionStatus{VMUID: "vm-uid", RevocationEpoch: 3}
+		ws.Status.Conditions = []v1alpha1.WorkspaceCondition{}
+		Expect(k8sClient.Status().Update(ctx, ws)).To(Succeed())
+		for _, epoch := range []int64{2, -1} {
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ws), ws)).To(Succeed())
+			ws.Status.ManagementExecution.RevocationEpoch = epoch
+			Expect(apierrors.IsInvalid(k8sClient.Status().Update(ctx, ws))).To(BeTrue())
+		}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ws), ws)).To(Succeed())
+		ws.Status.ManagementExecution = nil
+		Expect(apierrors.IsInvalid(k8sClient.Status().Update(ctx, ws))).To(BeTrue())
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ws), ws)).To(Succeed())
+		ws.Status.ManagementExecution.VMUID = "reset-vm-uid"
+		ws.Status.ManagementExecution.RevocationEpoch = 4
+		Expect(k8sClient.Status().Update(ctx, ws)).To(Succeed())
+	})
 	It("persists separately granted elevation without granting namespace membership", func() {
 		user := &v1alpha1.User{
 			ObjectMeta: metav1.ObjectMeta{GenerateName: "execution-grants-"},

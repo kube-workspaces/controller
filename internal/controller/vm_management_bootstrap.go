@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"time"
 
 	workspacev1 "github.com/kube-workspaces/controller/api/v1alpha1"
@@ -37,8 +38,12 @@ type managementBootstrapDocument struct {
 	ExpiresAt       time.Time `json:"expires_at"`
 }
 
-func managementBootstrapSecretName(workspaceUID, vmUID string) string {
-	sum := sha256.Sum256([]byte(workspaceUID + "/" + vmUID))
+func managementBootstrapSecretName(workspaceUID, vmUID string, epoch ...int64) string {
+	identity := workspaceUID + "/" + vmUID
+	if len(epoch) > 0 && epoch[0] != 0 {
+		identity += "/" + strconv.FormatInt(epoch[0], 10)
+	}
+	sum := sha256.Sum256([]byte(identity))
 	return "kw-mgmt-" + hex.EncodeToString(sum[:16])
 }
 
@@ -81,7 +86,8 @@ func managementBootstrapMatches(secret *corev1.Secret, ws *workspacev1.Workspace
 		return false
 	}
 	nonce, err := base64.RawURLEncoding.DecodeString(doc.Token)
-	return err == nil && len(nonce) == 32 && base64.RawURLEncoding.EncodeToString(nonce) == doc.Token && doc.Version == 1 && doc.Namespace == ws.Namespace && doc.WorkspaceName == ws.Name && doc.WorkspaceUID == string(ws.UID) && doc.Generation == string(vm.GetUID()) && doc.RevocationEpoch == 0 && !doc.ExpiresAt.IsZero() && !doc.ExpiresAt.After(now.Add(managementBootstrapLifetime))
+	state := ws.Status.ManagementExecution
+	return state != nil && state.VMUID == string(vm.GetUID()) && state.RevocationEpoch >= 0 && err == nil && len(nonce) == 32 && base64.RawURLEncoding.EncodeToString(nonce) == doc.Token && doc.Version == 1 && doc.Namespace == ws.Namespace && doc.WorkspaceName == ws.Name && doc.WorkspaceUID == string(ws.UID) && doc.Generation == string(vm.GetUID()) && doc.RevocationEpoch == uint64(state.RevocationEpoch) && !doc.ExpiresAt.IsZero() && !doc.ExpiresAt.After(now.Add(managementBootstrapLifetime))
 }
 
 // reconcileManagementBootstrap is opt-in. The namespace must be inaccessible to
@@ -117,9 +123,14 @@ func (r *WorkspaceReconciler) reconcileManagementBootstrap(ctx context.Context, 
 	if !managementVMCurrent(ws, vm, observedVM) {
 		return fmt.Errorf("management bootstrap VM identity is not current")
 	}
-	name := managementBootstrapSecretName(string(ws.UID), string(vm.GetUID()))
+	state := ws.Status.ManagementExecution
+	requested, err := requestedExecutionEpoch(ws)
+	if err != nil || state == nil || state.VMUID != string(vm.GetUID()) || state.RevocationEpoch < 0 || requested > state.RevocationEpoch {
+		return fmt.Errorf("management bootstrap execution epoch is not current")
+	}
+	name := managementBootstrapSecretName(string(ws.UID), string(vm.GetUID()), state.RevocationEpoch)
 	secret := &corev1.Secret{}
-	err := reader.Get(ctx, types.NamespacedName{Namespace: r.ManagementBootstrapNamespace, Name: name}, secret)
+	err = reader.Get(ctx, types.NamespacedName{Namespace: r.ManagementBootstrapNamespace, Name: name}, secret)
 	if err == nil {
 		if !managementBootstrapMatches(secret, ws, vm, time.Now()) {
 			return fmt.Errorf("management bootstrap Secret identity conflicts")
@@ -133,7 +144,7 @@ func (r *WorkspaceReconciler) reconcileManagementBootstrap(ctx context.Context, 
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return fmt.Errorf("management bootstrap entropy unavailable")
 	}
-	doc := managementBootstrapDocument{Version: 1, Token: base64.RawURLEncoding.EncodeToString(nonce[:]), Namespace: ws.Namespace, WorkspaceName: ws.Name, WorkspaceUID: string(ws.UID), Generation: string(vm.GetUID()), RevocationEpoch: 0, ExpiresAt: time.Now().UTC().Truncate(time.Microsecond).Add(managementBootstrapLifetime)}
+	doc := managementBootstrapDocument{Version: 1, Token: base64.RawURLEncoding.EncodeToString(nonce[:]), Namespace: ws.Namespace, WorkspaceName: ws.Name, WorkspaceUID: string(ws.UID), Generation: string(vm.GetUID()), RevocationEpoch: uint64(state.RevocationEpoch), ExpiresAt: time.Now().UTC().Truncate(time.Microsecond).Add(managementBootstrapLifetime)}
 	raw, err := json.Marshal(doc)
 	if err != nil {
 		return fmt.Errorf("management bootstrap encoding failed")

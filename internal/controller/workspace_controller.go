@@ -600,7 +600,7 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 		if justCreated {
 			managementVM = desired
 		}
-		if err := r.reconcileManagementBootstrap(ctx, instance, managementVM); err != nil {
+		if err := r.reconcileManagementIdentity(ctx, instance, managementVM); err != nil {
 			return 0, pod, err
 		}
 		readyReplicas = 1
@@ -917,9 +917,10 @@ func (r *WorkspaceReconciler) updateWorkspaceStatus(ctx context.Context,
 	log := logf.FromContext(ctx)
 
 	status := kubeworkspacesiov1alpha1.WorkspaceStatus{
-		Conditions:     make([]kubeworkspacesiov1alpha1.WorkspaceCondition, 0),
-		ReadyReplicas:  readyReplicas,
-		ContainerState: corev1.ContainerState{},
+		ManagementExecution: ws.Status.ManagementExecution.DeepCopy(),
+		Conditions:          make([]kubeworkspacesiov1alpha1.WorkspaceCondition, 0),
+		ReadyReplicas:       readyReplicas,
+		ContainerState:      corev1.ContainerState{},
 	}
 
 	// Update the status based on the Pod's status
@@ -948,6 +949,9 @@ func (r *WorkspaceReconciler) updateWorkspaceStatus(ctx context.Context,
 			if err := r.Get(ctx, types.NamespacedName{Name: ws.Name, Namespace: ws.Namespace}, latest); err != nil {
 				return err
 			}
+			// Readiness updates must never roll back an independently reconciled
+			// execution epoch, including on conflict retries.
+			status.ManagementExecution = latest.Status.ManagementExecution.DeepCopy()
 			latest.Status = status
 			return r.Status().Update(ctx, latest)
 		})

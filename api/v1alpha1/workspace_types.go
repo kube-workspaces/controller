@@ -26,6 +26,14 @@ import (
 // +kubebuilder:validation:XValidation:rule="!has(self.vmProfile) || self.type == 'vm'",message="VM guest profiles require type vm"
 // +kubebuilder:validation:XValidation:rule="!has(self.vmProfile) || (size(self.template.spec.containers) == 1 && self.template.spec.containers[0].image == self.vmProfile.image)",message="The main image must match the resolved VM source"
 type WorkspaceSpec struct {
+	// ExecutionRevocationEpoch requests a minimum execution epoch. The request
+	// itself is monotonic so a pending revocation cannot be undone before the
+	// controller acknowledges it in status. It never supplies authority.
+	// +kubebuilder:default=0
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:XValidation:rule="self >= oldSelf",message="Execution revocation request cannot decrease"
+	// +optional
+	ExecutionRevocationEpoch int64 `json:"executionRevocationEpoch,omitempty"`
 	// VMProfile is the stable resolved guest/source identity for VM workspaces.
 	// +optional
 	VMProfile *ResolvedVMProfile `json:"vmProfile,omitempty"`
@@ -68,13 +76,32 @@ type WorkspaceCondition struct {
 }
 
 // WorkspaceStatus defines the observed state of Workspace.
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.managementExecution) || has(self.managementExecution)",message="Management execution identity cannot be removed"
 type WorkspaceStatus struct {
+	// ManagementExecution is controller-owned execution authority, never derived
+	// from a tenant-supplied generation or epoch. Restrict status writes to the
+	// controller. Missing/stale state denies management admission.
+	// +optional
+	ManagementExecution *ManagementExecutionStatus `json:"managementExecution,omitempty"`
 	// Conditions is an array of current conditions
 	Conditions []WorkspaceCondition `json:"conditions"`
 	// ReadyReplicas is the number of Pods created by the StatefulSet controller that have a Ready Condition.
 	ReadyReplicas int32 `json:"readyReplicas"`
 	// ContainerState is the state of the underlying workspace container.
 	ContainerState corev1.ContainerState `json:"containerState"`
+}
+
+// ManagementExecutionStatus binds execution authority to the current VM UID.
+type ManagementExecutionStatus struct {
+	// VMUID changes on root reset/recreation, not ordinary VMI reboot.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	VMUID string `json:"vmUID"`
+	// RevocationEpoch never decreases during this Workspace's lifetime, including
+	// VM recreation. Increasing it invalidates old grants and enrollment material.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:XValidation:rule="self >= oldSelf",message="Execution revocation epoch cannot decrease"
+	RevocationEpoch int64 `json:"revocationEpoch"`
 }
 
 // +kubebuilder:object:root=true

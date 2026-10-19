@@ -30,9 +30,10 @@ func managementFixture(t *testing.T) (*WorkspaceReconciler, *workspacev1.Workspa
 	vm.SetNamespace(ws.Namespace)
 	vm.SetName(ws.Name)
 	vm.SetUID("vm-uid")
+	ws.Status.ManagementExecution = &workspacev1.ManagementExecutionStatus{VMUID: string(vm.GetUID()), RevocationEpoch: 0}
 	yes := true
 	vm.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: "kubeworkspaces.io/v1alpha1", Kind: "Workspace", Name: ws.Name, UID: ws.UID, Controller: &yes}})
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ws, vm).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(ws).WithObjects(ws, vm).Build()
 	return &WorkspaceReconciler{Client: cl, APIReader: cl, Scheme: scheme, ManagementBootstrapNamespace: "control-system"}, ws, vm
 }
 
