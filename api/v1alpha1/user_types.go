@@ -95,6 +95,20 @@ type LocalAuthSpec struct {
 	MustChangePassword bool `json:"mustChangePassword,omitempty"`
 }
 
+// ExternalIdentityBinding associates a verified external identity with this User.
+// Email equality is not proof of ownership. API-managed bindings also reserve an
+// atomic issuer/subject claim before they can be used for authentication.
+type ExternalIdentityBinding struct {
+	// Issuer is the exact OIDC issuer URL, without case or slash normalization.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=2048
+	Issuer string `json:"issuer"`
+	// Subject is the provider's stable, case-sensitive subject identifier.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=255
+	Subject string `json:"subject"`
+}
+
 // UserSpec defines the desired state of User.
 type UserSpec struct {
 	// Email is the unique identifier for the user (immutable).
@@ -125,6 +139,15 @@ type UserSpec struct {
 	// May be set alongside other authentication methods (e.g. OIDC) for the same identity.
 	// +optional
 	LocalAuth *LocalAuthSpec `json:"localAuth,omitempty"`
+	// ExternalIdentities lists explicitly linked, verified external identities.
+	// Local-only accounts omit this list. Adding a binding preserves the User UID,
+	// personal namespace and existing authorization grants.
+	// +optional
+	// +kubebuilder:validation:MaxItems=20
+	// +listType=map
+	// +listMapKey=issuer
+	// +listMapKey=subject
+	ExternalIdentities []ExternalIdentityBinding `json:"externalIdentities,omitempty"`
 }
 
 // UserStatus defines the observed state of User.
