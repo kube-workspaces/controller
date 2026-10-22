@@ -118,6 +118,16 @@ type ImageSpec struct {
 	// Chrome/Chromium, ML frameworks).
 	// +optional
 	DefaultSharedMemory bool `json:"defaultSharedMemory,omitempty"`
+	// DefaultImagePullPolicy is the image pull policy used by workspace containers
+	// created from this image (Always, IfNotPresent, Never). Images published under
+	// a mutable tag (e.g. "latest") should set Always so restarted workspaces pick
+	// up new releases; digest-pinned images are better served by IfNotPresent.
+	// Empty leaves the field unset on the container so Kubernetes applies its own
+	// default (Always for :latest or untagged references, IfNotPresent otherwise).
+	// A workspace may still override this per workspace.
+	// +kubebuilder:validation:Enum=Always;IfNotPresent;Never
+	// +optional
+	DefaultImagePullPolicy string `json:"defaultImagePullPolicy,omitempty"`
 	// WorkspaceTypes lists the workspace types this image can be used with
 	// ("container", "vm", "scratch"). When empty, the image is offered for
 	// "container" workspaces only. VM images must be containerDisk images
