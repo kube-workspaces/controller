@@ -111,10 +111,25 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
-	// If user is disabled, skip reconciliation of namespaces/RBAC
+	// Disablement removes existing grants without deleting the User, personal
+	// namespace, workloads, quotas or the desired grants needed for re-enablement.
 	if user.Spec.Disabled {
-		log.Info("user is disabled, skipping reconciliation", "user", user.Name)
-		return ctrl.Result{}, nil
+		if err := r.cleanupStaleRoleBindings(ctx, &user); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to revoke disabled user grants: %w", err)
+		}
+		previousStatus := user.DeepCopy().Status
+		setCondition(&user.Status.Conditions, metav1.Condition{
+			Type: "Ready", Status: metav1.ConditionFalse, Reason: "Disabled",
+			Message: "User is disabled; managed namespace grants have been revoked",
+		})
+		if !reflect.DeepEqual(previousStatus, user.Status) {
+			if err := r.Status().Update(ctx, &user); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		// RoleBindings have no owner references, so periodically recheck while
+		// disabled in case a previously managed grant is restored externally.
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	// Fetch AuthConfig to determine personal namespace settings
@@ -360,18 +375,20 @@ func (r *UserReconciler) cleanupStaleRoleBindings(ctx context.Context, user *kub
 
 	// Build set of desired namespaces
 	desiredNamespaces := make(map[string]bool)
-	if user.Status.PersonalNamespace != "" {
-		desiredNamespaces[user.Status.PersonalNamespace] = true
-	}
-	for _, access := range user.Spec.NamespaceAccess {
-		desiredNamespaces[access.Namespace] = true
+	if !user.Spec.Disabled {
+		if user.Status.PersonalNamespace != "" {
+			desiredNamespaces[user.Status.PersonalNamespace] = true
+		}
+		for _, access := range user.Spec.NamespaceAccess {
+			desiredNamespaces[access.Namespace] = true
+		}
 	}
 
 	// Delete RoleBindings in namespaces not in desired set
 	for i := range rbList.Items {
 		rb := &rbList.Items[i]
 		if !desiredNamespaces[rb.Namespace] {
-			if err := r.Delete(ctx, rb); err != nil && !errors.IsNotFound(err) {
+			if err := r.Delete(ctx, rb, client.Preconditions{UID: &rb.UID, ResourceVersion: &rb.ResourceVersion}); err != nil && !errors.IsNotFound(err) {
 				return err
 			}
 		}

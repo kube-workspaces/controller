@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -99,7 +100,7 @@ var _ = Describe("User Controller", func() {
 			Expect(updatedUser.Finalizers).To(ContainElement(UserFinalizer))
 		})
 
-		It("should skip reconciliation for disabled users", func() {
+		It("should recheck revoked grants for disabled users", func() {
 			// Create AuthConfig first so reconcile doesn't error
 			authConfig := &kubeworkspacesiov1alpha1.AuthConfig{
 				ObjectMeta: metav1.ObjectMeta{
@@ -128,7 +129,7 @@ var _ = Describe("User Controller", func() {
 				NamespacedName: types.NamespacedName{Name: userName},
 			})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(BeZero())
+			Expect(result.RequeueAfter).To(Equal(30 * time.Second))
 		})
 
 		It("should return not-found error gracefully for non-existent user", func() {
