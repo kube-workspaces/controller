@@ -144,6 +144,7 @@ rules:
 - apiGroups:
   - kubeworkspaces.io
   resources:
+  - platformconfigs
   - sshkeys
   verbs:
   - get

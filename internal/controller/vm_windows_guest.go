@@ -65,7 +65,10 @@ func (r *WorkspaceReconciler) preflightWindows(ctx context.Context, instance *wo
 	if err := r.preflightWindowsNode(ctx, instance); err != nil {
 		return err
 	}
-	return r.preflightWindowsInfrastructure(ctx, instance)
+	if err := r.preflightWindowsInfrastructure(ctx, instance); err != nil {
+		return err
+	}
+	return r.preflightWindowsGPU(ctx, instance)
 }
 
 func (r *WorkspaceReconciler) preflightWindowsNode(ctx context.Context, instance *workspacev1.Workspace) error {
@@ -197,6 +200,19 @@ func validateWindowsProfile(instance *workspacev1.Workspace) error {
 	}
 	if len(containers[0].VolumeMounts) != 0 || len(instance.Spec.Template.Spec.Volumes) != 0 {
 		return fmt.Errorf("windows automatic user-disk mounting is not supported")
+	}
+	for name := range containers[0].Resources.Limits {
+		if strings.Contains(string(name), "/") {
+			return fmt.Errorf("windows GPU resources require a typed operator profile, not container limits")
+		}
+	}
+	for name := range containers[0].Resources.Requests {
+		if strings.Contains(string(name), "/") {
+			return fmt.Errorf("windows GPU resources require a typed operator profile, not container requests")
+		}
+	}
+	if err := validateVMGPUProfile(profile.GPU); err != nil {
+		return err
 	}
 	if profile.CPUCores < 2 {
 		return fmt.Errorf("windows 11 requires at least 2 guest CPU cores")
@@ -656,6 +672,7 @@ func generateWindowsVirtualMachine(instance *workspacev1.Workspace, agentPort in
 		"clock":    map[string]interface{}{"utc": map[string]interface{}{}, "timer": map[string]interface{}{"hpet": map[string]interface{}{"present": false}, "pit": map[string]interface{}{"tickPolicy": "delay"}, "rtc": map[string]interface{}{"tickPolicy": "catchup"}, "hyperv": map[string]interface{}{"present": true}}},
 		"devices":  map[string]interface{}{"tpm": map[string]interface{}{"persistent": true}, "autoattachGraphicsDevice": true, "autoattachSerialConsole": false, "video": map[string]interface{}{"type": "vga"}, "disks": disks, "inputs": []interface{}{map[string]interface{}{"name": "tablet", "type": "tablet", "bus": "usb"}}, "interfaces": []interface{}{defaultInterface}},
 	}
+	applyWindowsGPU(instance, domain)
 	_, stopped := instance.Annotations[AnnotationStopped]
 	stopped = stopped || instance.Annotations[windowsDetachingGeneration] == profile.Generation
 	stopped = stopped || instance.Annotations[windowsRebootAnnotation] != ""

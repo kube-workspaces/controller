@@ -125,6 +125,7 @@ type WorkspaceReconciler struct {
 
 // +kubebuilder:rbac:groups=kubeworkspaces.io,resources=images,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=kubeworkspaces.io,resources=sshkeys,verbs=get;list;watch
+// +kubebuilder:rbac:groups=kubeworkspaces.io,resources=platformconfigs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kubeworkspaces.io,resources=workspaces,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kubeworkspaces.io,resources=workspaces/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=kubeworkspaces.io,resources=workspaces/finalizers,verbs=update
@@ -540,6 +541,11 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 	err = r.Get(ctx, types.NamespacedName{Name: desired.GetName(), Namespace: desired.GetNamespace()}, found)
 	if err != nil && apierrs.IsNotFound(err) {
 		log.Info("Creating VirtualMachine", "namespace", desired.GetNamespace(), "name", desired.GetName())
+		if windowsWorkspace(instance) {
+			if err := r.preflightWindowsGPU(ctx, instance); err != nil {
+				return 0, nil, err
+			}
+		}
 		err = r.Create(ctx, desired)
 		justCreated = true
 		if err != nil {
@@ -556,22 +562,7 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 			return 0, nil, fmt.Errorf("existing VM identity cannot change without an explicit Reset")
 		}
 		preserveLegacyRootDisk(desired, found)
-	}
-	if !justCreated && virtualMachineNeedsUpdate(desired, found) {
-		log.Info("Updating VirtualMachine", "namespace", desired.GetNamespace(), "name", desired.GetName())
-		err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			latest := &unstructured.Unstructured{}
-			latest.SetGroupVersionKind(kubeVirtVirtualMachineGVK)
-			if err := r.Get(ctx, types.NamespacedName{Name: desired.GetName(), Namespace: desired.GetNamespace()}, latest); err != nil {
-				return err
-			}
-			if !virtualMachineNeedsUpdate(desired, latest) {
-				return nil
-			}
-			latest.Object["spec"] = desired.Object["spec"]
-			return r.Update(ctx, latest)
-		})
-		if err != nil {
+		if err := r.updateVirtualMachine(ctx, instance, desired, found); err != nil {
 			return 0, nil, err
 		}
 	}
@@ -606,6 +597,33 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 		readyReplicas = 1
 	}
 	return readyReplicas, pod, nil
+}
+
+func (r *WorkspaceReconciler) updateVirtualMachine(ctx context.Context, instance *kubeworkspacesiov1alpha1.Workspace, desired, found *unstructured.Unstructured) error {
+	if !virtualMachineNeedsUpdate(desired, found) {
+		return nil
+	}
+	logf.FromContext(ctx).Info("Updating VirtualMachine", "namespace", desired.GetNamespace(), "name", desired.GetName())
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &unstructured.Unstructured{}
+		latest.SetGroupVersionKind(kubeVirtVirtualMachineGVK)
+		if err := r.Get(ctx, types.NamespacedName{Name: desired.GetName(), Namespace: desired.GetNamespace()}, latest); err != nil {
+			return err
+		}
+		if latest.GetUID() != found.GetUID() || latest.GetDeletionTimestamp() != nil {
+			return fmt.Errorf("virtual machine identity changed while reconciling")
+		}
+		if !virtualMachineNeedsUpdate(desired, latest) {
+			return nil
+		}
+		if windowsWorkspace(instance) {
+			if err := r.guardWindowsGPUTransition(ctx, instance, desired, latest); err != nil {
+				return err
+			}
+		}
+		latest.Object["spec"] = desired.Object["spec"]
+		return r.Update(ctx, latest)
+	})
 }
 
 // Prepare the guest's native bootstrap before its VM can reference the Secret.

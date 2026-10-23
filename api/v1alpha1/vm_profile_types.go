@@ -19,10 +19,48 @@ package v1alpha1
 // Windows11AMD64V1 is the controller-supported Windows guest hardware contract.
 const Windows11AMD64V1 = "windows11-amd64-v1"
 
+// VMGPUProfile is an operator-declared, versioned render-only VM GPU contract.
+// Use a new ID for hardware/driver changes; existing workspace snapshots must
+// not be silently rewritten when platform configuration changes.
+type VMGPUProfile struct {
+	// ID names this exact version of the profile.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`
+	// +kubebuilder:validation:MaxLength=63
+	ID string `json:"id"`
+	// DisplayName is an operator-facing label, not a support certification.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	DisplayName string `json:"displayName"`
+	// ResourceName is the exact device-plugin extended resource, not a /gpu heuristic.
+	// +kubebuilder:validation:MaxLength=253
+	ResourceName string `json:"resourceName"`
+	// Kind selects the KubeVirt PCI or mediated-device allowlist.
+	// +kubebuilder:validation:Enum=pci;mediated
+	Kind string `json:"kind"`
+	// Count is one device allocation. Multi-device Windows profiles are not qualified.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1
+	Count int32 `json:"count"`
+	// NodeSelector restricts the certified worker selected for the Windows root.
+	// +kubebuilder:validation:MinProperties=1
+	NodeSelector map[string]string `json:"nodeSelector"`
+	// GuestDriverVersion identifies the separately provisioned Windows driver.
+	// This field does not install a driver or assert that the guest is using it.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	GuestDriverVersion string `json:"guestDriverVersion"`
+	// Experimental labels a research profile without claiming vendor/product support.
+	Experimental bool `json:"experimental"`
+}
+
 // ResolvedVMProfile pins a workspace's guest profile and prepared root source.
 // It is persisted before the VM is created so catalog edits/removal cannot
 // silently change the hardware or source of an existing guest.
 type ResolvedVMProfile struct {
+	// GPU is an optional operator-approved snapshot. Nil keeps software rendering.
+	// Hardware changes require the Workspace stopped and its VMI absent.
+	// +optional
+	GPU *VMGPUProfile `json:"gpu,omitempty"`
 
 	// ID selects a versioned controller-supported profile, not arbitrary QEMU configuration.
 	// +kubebuilder:validation:Enum=windows11-amd64-v1

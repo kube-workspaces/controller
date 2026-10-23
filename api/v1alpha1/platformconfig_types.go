@@ -80,6 +80,13 @@ type AgentUpgradePolicy struct {
 
 // PlatformConfigSpec defines the desired state of PlatformConfig.
 type PlatformConfigSpec struct {
+	// VMGPUProfiles declares versioned render-only Windows GPU choices.
+	// An absent/empty list permits only software Windows profiles.
+	// +listType=map
+	// +listMapKey=id
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	VMGPUProfiles []VMGPUProfile `json:"vmGPUProfiles,omitempty"`
 	// Maintenance configures maintenance mode for the platform.
 	// +optional
 	Maintenance *MaintenanceConfig `json:"maintenance,omitempty"`
