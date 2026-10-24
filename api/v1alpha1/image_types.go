@@ -23,7 +23,9 @@ import (
 
 // ImageSpec defines the desired state of Image.
 type ImageSpec struct {
-	// Container image reference (e.g. "codercom/code-server:latest").
+	// Container image reference (e.g. "codercom/code-server:latest"). VM-only
+	// images with PersistentRootDisk may instead use an absolute HTTP(S) URL
+	// to a bootable cloud disk; CDI imports it directly without OCI packaging.
 	Image string `json:"image"`
 	// Display name (e.g. "Code Server (VS Code)").
 	// +optional
@@ -130,8 +132,8 @@ type ImageSpec struct {
 	DefaultImagePullPolicy string `json:"defaultImagePullPolicy,omitempty"`
 	// WorkspaceTypes lists the workspace types this image can be used with
 	// ("container", "vm", "scratch"). When empty, the image is offered for
-	// "container" workspaces only. VM images must be containerDisk images
-	// containing a bootable guest disk.
+	// "container" workspaces only. VM images use a bootable containerDisk or,
+	// with PersistentRootDisk and only "vm" listed, an HTTP(S) cloud disk URL.
 	// +optional
 	WorkspaceTypes []string `json:"workspaceTypes,omitempty"`
 	// VMProfile selects a named controller-supported guest contract. Empty keeps
@@ -141,7 +143,8 @@ type ImageSpec struct {
 	// +optional
 	VMProfile string `json:"vmProfile,omitempty"`
 	// PersistentRootDisk indicates the VM root disk should be a DataVolume
-	// backing-persistent PVC imported from the container disk image (via CDI)
+	// backing-persistent PVC imported from the container disk image or HTTP(S)
+	// cloud disk URL (via CDI)
 	// rather than an ephemeral containerDisk. Requires a storage class that CDI
 	// can provision. Ignored for non-vm workspaces.
 	// +optional

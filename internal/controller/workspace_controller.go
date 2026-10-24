@@ -488,8 +488,8 @@ func (r *WorkspaceReconciler) lookupVMImage(ctx context.Context, instance *kubew
 }
 
 // reconcileVirtualMachine handles vm-type workspaces: a KubeVirt VirtualMachine
-// whose root disk is a containerDisk built from the workspace's main container
-// image. Status is derived from the virt-launcher pod, which KubeVirt labels
+// whose root disk is a containerDisk or a CDI registry/HTTP import from the
+// workspace's main image reference. Status is derived from the virt-launcher pod, which KubeVirt labels
 // with vm.kubevirt.io/name=<vm name>; we also inject the workspace-name label
 // into the VMI template so the existing pod watch maps it back to the Workspace.
 func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, instance *kubeworkspacesiov1alpha1.Workspace) (int32, *corev1.Pod, error) {
@@ -511,6 +511,12 @@ func (r *WorkspaceReconciler) reconcileVirtualMachine(ctx context.Context, insta
 	}
 	if resolved {
 		return 0, nil, nil
+	}
+	if err := validateVMRootImage(instance, img); err != nil {
+		return 0, nil, err
+	}
+	if err := r.ensureLinuxAgentGeneration(ctx, instance, img); err != nil {
+		return 0, nil, err
 	}
 	if windowsWorkspace(instance) {
 		if err := r.finishWindowsLifecycle(ctx, instance); err != nil {
@@ -809,6 +815,7 @@ func (r *WorkspaceReconciler) handleReset(ctx context.Context, instance *kubewor
 	log.Info("VirtualMachine deleted; clearing reset annotation", "namespace", instance.Namespace, "name", instance.Name)
 	annotations := instance.GetAnnotations()
 	delete(annotations, AnnotationReset)
+	delete(annotations, annotationAgentGeneration)
 	// A fresh re-provision is a fresh workspace: restart the ready-time clock.
 	delete(annotations, "kubeworkspaces.io/ready-time-recorded")
 	instance.SetAnnotations(annotations)
@@ -1353,7 +1360,7 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 	// so Windows vmProfile guests resolve their digest-pinned Image too.
 	interfaces, networks := vmDefaultNetwork(instance.Name, podSpec, agentPort)
 
-	// Root disk: an ephemeral containerDisk by default; a registry-imported
+	// Root disk: an ephemeral containerDisk by default; a registry/HTTP-imported
 	// DataVolume (persistent PVC) when the image opts in via PersistentRootDisk.
 	image := ""
 	if len(podSpec.Containers) > 0 {
@@ -1377,9 +1384,7 @@ func generateVirtualMachine(instance *kubeworkspacesiov1alpha1.Workspace, img *k
 		dataVolumeTemplates = append(dataVolumeTemplates, map[string]interface{}{
 			"metadata": map[string]interface{}{"name": diskName},
 			"spec": map[string]interface{}{
-				"source": map[string]interface{}{
-					"registry": map[string]interface{}{"url": "docker://" + image},
-				},
+				"source": vmRootDiskSource(image),
 				"pvc": map[string]interface{}{
 					"accessModes": []interface{}{"ReadWriteOnce"},
 					"resources": map[string]interface{}{

@@ -113,6 +113,10 @@ func (r *WorkspaceReconciler) claimVMDataVolume(ctx context.Context, reader clie
 // ext4 data is mounted as-is; partitioned/other filesystem disks are rejected.
 func vmCloudInitUserData(ws *kubeworkspacesiov1alpha1.Workspace, img *kubeworkspacesiov1alpha1.Image, keys []string) (string, error) {
 	data := cloudInitUserData(img, keys)
+	data, err := linuxAgentCloudInit(ws, img, data)
+	if err != nil {
+		return "", err
+	}
 	if len(ws.Spec.Template.Spec.Containers) == 0 || len(ws.Spec.Template.Spec.Containers[0].VolumeMounts) == 0 {
 		return data, nil
 	}
