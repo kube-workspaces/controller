@@ -104,6 +104,8 @@ rules:
   - kubeworkspaces.io
   resources:
   - authconfigs
+  - imagerepositories
+  - images
   - users
   - workspaces
   verbs:
@@ -118,6 +120,7 @@ rules:
   - kubeworkspaces.io
   resources:
   - authconfigs/finalizers
+  - imagerepositories/finalizers
   - users/finalizers
   - workspaces/finalizers
   verbs:
@@ -126,46 +129,9 @@ rules:
   - kubeworkspaces.io
   resources:
   - authconfigs/status
+  - imagerepositories/status
   - users/status
   - workspaces/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - kubeworkspaces.io
-  resources:
-  - images
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - kubeworkspaces.io
-  resources:
-  - imagerepositories
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - kubeworkspaces.io
-  resources:
-  - imagerepositories/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - kubeworkspaces.io
-  resources:
-  - imagerepositories/status
   verbs:
   - get
   - patch
