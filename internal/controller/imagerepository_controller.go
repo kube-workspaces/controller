@@ -29,6 +29,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	"github.com/go-git/go-git/v5/plumbing/transport/http"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -105,10 +107,10 @@ func (r *ImageRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	// If we synced recently and not forced, requeue
-	if !forceSync && repo.Status.LastSyncTime != nil {
+	if !forceSync && repo.Status.ObservedGeneration == repo.Generation && repo.Status.LastSyncTime != nil {
 		since := time.Since(repo.Status.LastSyncTime.Time)
-		if since < interval {
-			return ctrl.Result{RequeueAfter: interval - since + time.Minute}, nil
+		if since < interval && meta.IsStatusConditionTrue(repo.Status.Conditions, "Ready") {
+			return ctrl.Result{RequeueAfter: interval - since}, nil
 		}
 	}
 
@@ -243,14 +245,20 @@ func (r *ImageRepositoryReconciler) syncRepo(ctx context.Context, repo *kubework
 		}
 	}
 
-	// GC
+	// Prune only images currently assigned to this repository. Adoption by a
+	// different repository changes this label, so the former source cannot prune it.
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(schema.GroupVersionKind{Group: "kubeworkspaces.io", Version: "v1alpha1", Kind: "ImageList"})
-	if err := r.List(ctx, list, client.MatchingLabels{imageRepositoryLabelKey: repo.Name}); err == nil {
-		for i := range list.Items {
-			n := list.Items[i].GetName()
-			if _, ok := desired[n]; !ok {
-				_ = r.Delete(ctx, &list.Items[i])
+	if err := r.List(ctx, list, client.MatchingLabels{imageRepositoryLabelKey: repo.Name}); err != nil {
+		return nil, fmt.Errorf("list images for pruning: %w", err)
+	}
+	for i := range list.Items {
+		image := &list.Items[i]
+		if _, ok := desired[image.GetName()]; !ok {
+			// A concurrent adoption/update must not be deleted using a stale list.
+			uid, version := image.GetUID(), image.GetResourceVersion()
+			if err := r.Delete(ctx, image, client.Preconditions{UID: &uid, ResourceVersion: &version}); err != nil && !apierrors.IsNotFound(err) {
+				return nil, fmt.Errorf("prune image %s: %w", image.GetName(), err)
 			}
 		}
 	}
@@ -275,19 +283,25 @@ func (r *ImageRepositoryReconciler) syncImageFile(ctx context.Context, repo *kub
 	if err != nil {
 		return "", err
 	}
-	var u map[string]interface{}
-	if err := yaml.Unmarshal(data, &u); err != nil {
+	jsonData, err := yaml.YAMLToJSON(data)
+	if err != nil {
 		return "", fmt.Errorf("parse %s: %w", path, err)
 	}
-	kind, _ := u["kind"].(string)
-	apiVersion, _ := u["apiVersion"].(string)
-	if kind != "Image" || !strings.Contains(apiVersion, "kubeworkspaces.io") {
+	// Use Kubernetes' JSON decoder to preserve integer fields. Generic YAML/JSON
+	// decoding turns numbers into float64 and makes unchanged specs look modified.
+	obj := &unstructured.Unstructured{}
+	if err := obj.UnmarshalJSON(jsonData); err != nil {
+		return "", fmt.Errorf("parse %s: %w", path, err)
+	}
+	if obj.GetKind() != "Image" || obj.GroupVersionKind().Group != "kubeworkspaces.io" {
 		return "", nil
 	}
-	obj := &unstructured.Unstructured{Object: u}
 	name := obj.GetName()
 	if name == "" {
 		return "", nil
+	}
+	if _, ok := obj.Object["spec"].(map[string]interface{}); !ok {
+		return "", fmt.Errorf("image %s is missing a spec object", name)
 	}
 	labels := obj.GetLabels()
 	if labels == nil {
@@ -306,15 +320,44 @@ func (r *ImageRepositoryReconciler) syncImageFile(ctx context.Context, repo *kub
 	ann[imageRepositorySourcePath] = strings.TrimPrefix(path, root+"/")
 	obj.SetAnnotations(ann)
 
-	existing := &unstructured.Unstructured{}
-	existing.SetGroupVersionKind(schema.GroupVersionKind{Group: "kubeworkspaces.io", Version: "v1alpha1", Kind: "Image"})
-	err = r.Get(ctx, types.NamespacedName{Name: name}, existing)
-	if apierrors.IsNotFound(err) {
-		err = r.Create(ctx, obj)
-	} else if err == nil {
-		obj.SetResourceVersion(existing.GetResourceVersion())
-		err = r.Update(ctx, obj)
-	}
+	err = retry.OnError(retry.DefaultBackoff, func(err error) bool {
+		return apierrors.IsConflict(err) || apierrors.IsAlreadyExists(err)
+	}, func() error {
+		existing := &unstructured.Unstructured{}
+		existing.SetGroupVersionKind(obj.GroupVersionKind())
+		if err := r.Get(ctx, types.NamespacedName{Name: name}, existing); err != nil {
+			if apierrors.IsNotFound(err) {
+				return r.Create(ctx, obj.DeepCopy())
+			}
+			return err
+		}
+
+		// The repository is authoritative for the complete spec, including when
+		// adopting a preinstalled/manual Image. Keep the live object's identity,
+		// finalizers and unrelated metadata instead of replacing its ObjectMeta.
+		updated := existing.DeepCopy()
+		updated.Object["spec"] = runtime.DeepCopyJSONValue(obj.Object["spec"])
+		mergedLabels := updated.GetLabels()
+		if mergedLabels == nil {
+			mergedLabels = map[string]string{}
+		}
+		for key, value := range obj.GetLabels() {
+			mergedLabels[key] = value
+		}
+		updated.SetLabels(mergedLabels)
+		mergedAnnotations := updated.GetAnnotations()
+		if mergedAnnotations == nil {
+			mergedAnnotations = map[string]string{}
+		}
+		for key, value := range obj.GetAnnotations() {
+			mergedAnnotations[key] = value
+		}
+		updated.SetAnnotations(mergedAnnotations)
+		if equality.Semantic.DeepEqual(existing.Object, updated.Object) {
+			return nil
+		}
+		return r.Update(ctx, updated)
+	})
 	if err != nil {
 		return "", err
 	}

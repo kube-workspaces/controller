@@ -36,6 +36,7 @@ The controller owns the `kubeworkspaces.io` API group (`v1alpha1`):
 |------|-------|
 | `Workspace` | Namespaced |
 | `Image` | Cluster |
+| `ImageRepository` | Cluster |
 | `User` | Cluster |
 | `AuthConfig` | Cluster |
 | `PlatformConfig` | Cluster |
@@ -46,6 +47,44 @@ The `Workspace` spec wraps a full `corev1.PodSpec` under `spec.template.spec`,
 mirroring the Kubeflow Notebook CRD pattern. This gives full flexibility for
 container configuration including env vars, args, volume mounts, resource
 limits, etc.
+
+## Image repository sync and adoption
+
+An `ImageRepository` imports Image CR YAML files from Git on its sync interval
+(10 minutes by default). Each configured `spec.paths` directory is scanned for
+direct `.yaml` / `.yml` children; list subdirectories explicitly.
+
+The repository is authoritative for an Image with the same **metadata.name**:
+
+- Missing images are created. Existing images, including manually created or
+  preinstalled images, are adopted in place and their complete spec is replaced
+  by the repository manifest. Fields removed upstream are removed locally.
+- Adoption preserves the Image UID, finalizers, and unrelated labels/annotations.
+  Manifest metadata and source provenance override matching metadata keys.
+- The `kubeworkspaces.io/image-repository` label records the owning repository;
+  `kubeworkspaces.io/managed-by: imagerepository-controller` identifies the manager.
+  The `source-url`, `source-ref`, `source-commit`, and `source-path` annotations
+  under `kubeworkspaces.io/` record the exact catalog origin. The API exposes
+  these separately from an application's source URL for the Images page filter.
+- Ownership is label-based, not a Kubernetes garbage-collection owner reference.
+  After a successful import, images assigned to that repository but no longer
+  present in its configured paths are pruned. Other repositories' images and
+  untracked images are left alone. Deleting a repository does not cascade-delete
+  its images.
+
+The same adoption path runs for fresh installations and existing clusters, even
+when the Git commit has not changed. An immediate sync can be requested with:
+
+```bash
+kubectl annotate imagerepository image-catalog \
+  kubeworkspaces.io/sync="$(date -u +%s)" --overwrite
+```
+
+Changes to the repository spec trigger an immediate sync. Keep image names unique
+across repositories: if two sources define the same name, the last successful
+sync takes ownership. Manage adopted specs in Git rather than also reconciling
+them through Helm/ArgoCD; disable the static image manifests for a Git-managed
+catalog. Existing running workspaces are not recreated by image adoption.
 
 ## Status
 
