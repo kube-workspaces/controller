@@ -22,9 +22,11 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -80,6 +82,10 @@ func (r *AuthConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	// If auth is not enabled, just update status and return
 	if !authConfig.Spec.Enabled {
+		authConfig.Status.IssuerReachable = false
+		authConfig.Status.LastVerified = nil
+		meta.RemoveStatusCondition(&authConfig.Status.Conditions, "LocalAuthReady")
+		meta.RemoveStatusCondition(&authConfig.Status.Conditions, "OIDCReady")
 		condition := metav1.Condition{
 			Type:               "Ready",
 			Status:             metav1.ConditionTrue,
@@ -98,6 +104,10 @@ func (r *AuthConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	hasOIDC := authConfig.Spec.OIDC != nil && authConfig.Spec.OIDC.IssuerURL != ""
 	hasLocalAuth := authConfig.Spec.LocalAuth != nil && authConfig.Spec.LocalAuth.Enabled
 	if !hasOIDC && !hasLocalAuth {
+		authConfig.Status.IssuerReachable = false
+		authConfig.Status.LastVerified = nil
+		meta.RemoveStatusCondition(&authConfig.Status.Conditions, "LocalAuthReady")
+		meta.RemoveStatusCondition(&authConfig.Status.Conditions, "OIDCReady")
 		condition := metav1.Condition{
 			Type:               "Ready",
 			Status:             metav1.ConditionFalse,
@@ -113,17 +123,40 @@ func (r *AuthConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	// Reconcile the local-auth bootstrap admin user, independent of OIDC.
+	var localErr error
 	if hasLocalAuth {
-		if err := r.reconcileBootstrapAdmin(ctx, &authConfig); err != nil {
-			log.Error(err, "failed to reconcile bootstrap admin user")
-			r.EventRecorder.Event(&authConfig, "Warning", "BootstrapAdminFailed", err.Error())
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		localErr = r.reconcileBootstrapAdmin(ctx, &authConfig)
+		if localErr != nil {
+			log.Error(localErr, "failed to reconcile bootstrap admin user")
+			if r.EventRecorder != nil {
+				r.EventRecorder.Event(&authConfig, "Warning", "BootstrapAdminFailed", localErr.Error())
+			}
 		}
+	}
+	methodConditions := func() {
+		local := metav1.Condition{Type: "LocalAuthReady", Status: metav1.ConditionFalse, Reason: "NotConfigured", Message: "Local authentication is not configured", ObservedGeneration: authConfig.Generation}
+		if hasLocalAuth {
+			local.Status, local.Reason, local.Message = metav1.ConditionTrue, "UsableAdministrator", "Local authentication has a usable recovery administrator (temporary passwords require change)"
+			if localErr != nil {
+				local.Status, local.Reason, local.Message = metav1.ConditionFalse, "BootstrapAdminUnavailable", localErr.Error()
+			}
+		}
+		setCondition(&authConfig.Status.Conditions, local)
+		oidc := metav1.Condition{Type: "OIDCReady", Status: metav1.ConditionFalse, Reason: "NotConfigured", Message: "OIDC is not configured", ObservedGeneration: authConfig.Generation}
+		if hasOIDC {
+			oidc.Reason, oidc.Message = "IssuerUnreachable", "OIDC issuer is not reachable"
+			if authConfig.Status.IssuerReachable {
+				oidc.Status, oidc.Reason, oidc.Message = metav1.ConditionTrue, "IssuerVerified", "OIDC issuer is reachable; this does not prove a provider sign-in"
+			}
+		}
+		setCondition(&authConfig.Status.Conditions, oidc)
 	}
 
 	// If OIDC is not configured, there is no issuer to verify; report ready
 	// based on local auth alone.
 	if !hasOIDC {
+		authConfig.Status.IssuerReachable = false
+		authConfig.Status.LastVerified = nil
 		condition := metav1.Condition{
 			Type:               "Ready",
 			Status:             metav1.ConditionTrue,
@@ -131,9 +164,16 @@ func (r *AuthConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			Reason:             "LocalAuthOnly",
 			Message:            "Authentication is enabled via local auth (no OIDC configured)",
 		}
+		if localErr != nil {
+			condition.Status, condition.Reason, condition.Message = metav1.ConditionFalse, "BootstrapAdminUnavailable", localErr.Error()
+		}
 		setCondition(&authConfig.Status.Conditions, condition)
+		methodConditions()
 		if err := updateStatus(); err != nil {
 			return ctrl.Result{}, err
+		}
+		if localErr != nil {
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
 		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 	}
@@ -163,6 +203,11 @@ func (r *AuthConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 		setCondition(&authConfig.Status.Conditions, condition)
 	}
+	// An IdP outage must not hide a usable independent local recovery path.
+	if !reachable && hasLocalAuth && localErr == nil {
+		setCondition(&authConfig.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionTrue, Reason: "LocalRecoveryAvailable", Message: "OIDC is unavailable; local recovery administrator is usable", ObservedGeneration: authConfig.Generation})
+	}
+	methodConditions()
 
 	if err := updateStatus(); err != nil {
 		return ctrl.Result{}, err
@@ -175,7 +220,7 @@ func (r *AuthConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 func (r *AuthConfigReconciler) verifyIssuer(ctx context.Context, issuerURL string) bool {
 	log := logf.FromContext(ctx)
 
-	wellKnownURL := issuerURL + "/.well-known/openid-configuration"
+	wellKnownURL := strings.TrimRight(issuerURL, "/") + "/.well-known/openid-configuration"
 
 	httpClient := &http.Client{
 		Timeout: 10 * time.Second,
@@ -186,7 +231,11 @@ func (r *AuthConfigReconciler) verifyIssuer(ctx context.Context, issuerURL strin
 		},
 	}
 
-	resp, err := httpClient.Get(wellKnownURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wellKnownURL, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		log.Info("OIDC issuer unreachable", "url", wellKnownURL, "error", err.Error())
 		return false

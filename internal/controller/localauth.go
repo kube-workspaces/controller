@@ -19,9 +19,11 @@ package controller
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 	corev1 "k8s.io/api/core/v1"
@@ -36,6 +38,8 @@ const (
 	// LocalAuthSystemNamespace is where local-auth password Secrets are stored,
 	// regardless of the user's personal namespace.
 	LocalAuthSystemNamespace = "kube-workspaces-system"
+
+	bootstrapOwnerAnnotation = "kubeworkspaces.io/bootstrap-authconfig-uid"
 
 	// PasswordSecretHashKey is the Secret key holding the bcrypt password hash.
 	PasswordSecretHashKey = "passwordHash"
@@ -96,24 +100,31 @@ func slugifyEmail(email string) string {
 	return s
 }
 
-// localAuthSecretName returns the conventional Secret name for a local user's
-// password material, given their slugified identifier.
-func localAuthSecretName(slug string) string {
-	return fmt.Sprintf("kw-user-%s-local-auth", slug)
+// localAuthSecretName is collision-resistant even for long/colliding emails.
+func localAuthSecretName(uid string) string {
+	sum := sha256.Sum256([]byte(uid))
+	return fmt.Sprintf("kw-password-%x", sum[:24])
 }
 
 // createLocalAuthSecret creates the password Secret for a local user, containing
 // both the bcrypt hash and (transiently) the plaintext password, and returns a
 // SecretKeyRef pointing at the hash key. It is a no-op (returns the existing ref)
-// if the Secret already exists, so it is safe to call repeatedly.
-func (r *AuthConfigReconciler) createLocalAuthSecret(ctx context.Context, slug, plaintextPassword string) (kubeworkspacesiov1alpha1.SecretKeyRef, error) {
-	name := localAuthSecretName(slug)
+// only if an existing Secret is verifiably owned by that same persisted UID.
+func (r *AuthConfigReconciler) createLocalAuthSecret(ctx context.Context, user *kubeworkspacesiov1alpha1.User, plaintextPassword string, mustChange bool) (kubeworkspacesiov1alpha1.SecretKeyRef, error) {
+	name := localAuthSecretName(string(user.UID))
 	ref := kubeworkspacesiov1alpha1.SecretKeyRef{Name: name, Key: PasswordSecretHashKey}
+	if user.UID == "" {
+		return ref, fmt.Errorf("persisted User UID is required for bootstrap credentials")
+	}
 
 	existing := &corev1.Secret{}
 	err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: LocalAuthSystemNamespace}, existing)
 	if err == nil {
-		// Secret already exists; never overwrite a user's password here.
+		owned := existing.Annotations[AnnotationUserUID] == string(user.UID) && metav1.IsControlledBy(existing, user)
+		_, hashErr := bcrypt.Cost(existing.Data[PasswordSecretHashKey])
+		if !owned || !existing.DeletionTimestamp.IsZero() || hashErr != nil {
+			return ref, fmt.Errorf("bootstrap password Secret %s ownership or credential mismatch; refusing adoption", name)
+		}
 		return ref, nil
 	}
 	if !errors.IsNotFound(err) {
@@ -131,30 +142,30 @@ func (r *AuthConfigReconciler) createLocalAuthSecret(ctx context.Context, slug, 
 			Namespace: LocalAuthSystemNamespace,
 			Labels: map[string]string{
 				LabelManagedByUser: ManagedByValue,
-				LabelUserName:      slug,
+				LabelUserName:      user.Name,
 			},
+			Annotations:     map[string]string{AnnotationUserUID: string(user.UID)},
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(user, kubeworkspacesiov1alpha1.GroupVersion.WithKind("User"))},
 		},
 		Type: corev1.SecretTypeOpaque,
 		StringData: map[string]string{
 			PasswordSecretHashKey:      hash,
 			PasswordSecretPlaintextKey: plaintextPassword,
+			"mustChangePassword":       fmt.Sprint(mustChange),
 		},
 	}
-	if err := r.Create(ctx, secret); err != nil && !errors.IsAlreadyExists(err) {
+	if err := r.Create(ctx, secret); err != nil {
 		return ref, fmt.Errorf("failed to create local-auth secret %s/%s: %w", LocalAuthSystemNamespace, name, err)
 	}
 	return ref, nil
 }
 
 // reconcileBootstrapAdmin ensures a default local admin User exists when local
-// auth is enabled, unless explicitly skipped or a local user already exists.
+// auth is enabled, unless explicitly skipped or a usable local admin exists.
 // It is idempotent: it never overwrites an existing User or password Secret.
 func (r *AuthConfigReconciler) reconcileBootstrapAdmin(ctx context.Context, authConfig *kubeworkspacesiov1alpha1.AuthConfig) error {
 	localAuth := authConfig.Spec.LocalAuth
 	if localAuth == nil || !localAuth.Enabled {
-		return nil
-	}
-	if localAuth.BootstrapAdmin != nil && localAuth.BootstrapAdmin.Skip {
 		return nil
 	}
 
@@ -167,44 +178,39 @@ func (r *AuthConfigReconciler) reconcileBootstrapAdmin(ctx context.Context, auth
 		mustChangePassword = *localAuth.BootstrapAdmin.MustChangePassword
 	}
 
-	// Skip if any local-auth-enabled user already exists (covers the case where
-	// an admin has already manually provisioned a local user).
+	// A disabled account, editor, missing hash or locked account cannot serve as
+	// the installation's independent local recovery administrator.
 	var userList kubeworkspacesiov1alpha1.UserList
 	if err := r.List(ctx, &userList); err != nil {
 		return fmt.Errorf("failed to list users: %w", err)
 	}
 	for _, u := range userList.Items {
-		if u.Spec.LocalAuth != nil && u.Spec.LocalAuth.Enabled {
+		if r.usableLocalAdmin(ctx, &u, authConfig) {
 			return nil
 		}
+	}
+	if localAuth.BootstrapAdmin != nil && localAuth.BootstrapAdmin.Skip {
+		return fmt.Errorf("bootstrap is skipped and no usable local administrator exists")
 	}
 
 	slug := slugifyEmail(email)
 
-	// Also skip if a User with this exact name already exists (e.g. created but
-	// not yet local-auth enabled), to avoid clobbering it.
+	// Resume only this AuthConfig's incomplete bootstrap transaction. A preexisting
+	// account is never promoted or given credentials merely by matching its name.
 	existing := &kubeworkspacesiov1alpha1.User{}
 	err := r.Get(ctx, client.ObjectKey{Name: slug}, existing)
 	if err == nil {
-		return nil
+		if authConfig.UID == "" || existing.Annotations[bootstrapOwnerAnnotation] != string(authConfig.UID) || existing.Spec.Email != email || existing.Spec.Role != kubeworkspacesiov1alpha1.UserRoleAdmin || existing.Spec.Disabled || !existing.DeletionTimestamp.IsZero() || existing.Spec.LocalAuth != nil {
+			return fmt.Errorf("bootstrap User %s already exists but is not a usable local administrator; recover the existing account in place", slug)
+		}
 	}
-	if !errors.IsNotFound(err) {
+	if err != nil && !errors.IsNotFound(err) {
 		return err
 	}
-
-	password, err := generatePassword()
-	if err != nil {
-		return err
-	}
-
-	ref, err := r.createLocalAuthSecret(ctx, slug, password)
-	if err != nil {
-		return err
-	}
-
 	user := &kubeworkspacesiov1alpha1.User{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: slug,
+			Name:        slug,
+			Annotations: map[string]string{bootstrapOwnerAnnotation: string(authConfig.UID)},
 			Labels: map[string]string{
 				"kubeworkspaces.io/role": string(kubeworkspacesiov1alpha1.UserRoleAdmin),
 			},
@@ -213,23 +219,74 @@ func (r *AuthConfigReconciler) reconcileBootstrapAdmin(ctx context.Context, auth
 			Email:       email,
 			DisplayName: "Administrator",
 			Role:        kubeworkspacesiov1alpha1.UserRoleAdmin,
-			LocalAuth: &kubeworkspacesiov1alpha1.LocalAuthSpec{
-				Enabled:            true,
-				PasswordSecretRef:  ref,
-				MustChangePassword: mustChangePassword,
-			},
 		},
 	}
-
-	if err := r.Create(ctx, user); err != nil && !errors.IsAlreadyExists(err) {
-		return fmt.Errorf("failed to create bootstrap admin user: %w", err)
+	if errors.IsNotFound(err) {
+		// Retained legacy password material requires explicit recovery, never
+		// adoption by a replacement bootstrap User with a new UID.
+		legacy := &corev1.Secret{}
+		if err := r.Get(ctx, client.ObjectKey{Name: fmt.Sprintf("kw-user-%s-local-auth", slug), Namespace: LocalAuthSystemNamespace}, legacy); err == nil {
+			return fmt.Errorf("retained legacy bootstrap credential exists; recover the original account in place")
+		} else if !errors.IsNotFound(err) {
+			return err
+		}
+		if err := r.Create(ctx, user); err != nil {
+			return fmt.Errorf("failed to create bootstrap admin user: %w", err)
+		}
+	} else {
+		user = existing
+	}
+	password, err := generatePassword()
+	if err != nil {
+		return err
+	}
+	ref, err := r.createLocalAuthSecret(ctx, user, password, mustChangePassword)
+	if err != nil {
+		return err
+	}
+	user.Spec.LocalAuth = &kubeworkspacesiov1alpha1.LocalAuthSpec{Enabled: true, PasswordSecretRef: ref, MustChangePassword: mustChangePassword}
+	delete(user.Annotations, bootstrapOwnerAnnotation)
+	if err := r.Update(ctx, user); err != nil {
+		return fmt.Errorf("failed to enable bootstrap administrator: %w", err)
 	}
 
 	if r.EventRecorder != nil {
 		r.EventRecorder.Event(authConfig, corev1.EventTypeNormal, "BootstrapAdminCreated",
 			fmt.Sprintf("Created default local admin user %q; retrieve the generated password from secret %s/%s",
-				email, LocalAuthSystemNamespace, localAuthSecretName(slug)))
+				email, LocalAuthSystemNamespace, ref.Name))
 	}
 
 	return nil
+}
+
+func (r *AuthConfigReconciler) usableLocalAdmin(ctx context.Context, user *kubeworkspacesiov1alpha1.User, cfg *kubeworkspacesiov1alpha1.AuthConfig) bool {
+	if user.Spec.Disabled || !user.DeletionTimestamp.IsZero() || user.Spec.LocalAuth == nil || !user.Spec.LocalAuth.Enabled {
+		return false
+	}
+	admin := user.Spec.Role == kubeworkspacesiov1alpha1.UserRoleAdmin
+	for _, email := range cfg.Spec.AdminEmails {
+		admin = admin || strings.EqualFold(email, user.Spec.Email)
+	}
+	if !admin || (user.Status.LockedUntil != nil && user.Status.LockedUntil.After(time.Now())) {
+		return false
+	}
+	ref := user.Spec.LocalAuth.PasswordSecretRef
+	secret := &corev1.Secret{}
+	if ref.Name == "" || r.Get(ctx, client.ObjectKey{Name: ref.Name, Namespace: LocalAuthSystemNamespace}, secret) != nil || !secret.DeletionTimestamp.IsZero() {
+		return false
+	}
+	if uid := secret.Annotations[AnnotationUserUID]; uid != "" && uid != string(user.UID) {
+		return false
+	}
+	for _, owner := range secret.OwnerReferences {
+		if owner.Kind == "User" && (owner.UID != user.UID || owner.Name != user.Name || owner.APIVersion != kubeworkspacesiov1alpha1.GroupVersion.String()) {
+			return false
+		}
+	}
+	key := ref.Key
+	if key == "" {
+		key = PasswordSecretHashKey
+	}
+	_, err := bcrypt.Cost(secret.Data[key])
+	return err == nil
 }

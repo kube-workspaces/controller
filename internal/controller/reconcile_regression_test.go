@@ -64,10 +64,10 @@ func TestUserCleanupRetriesFailedDeletions(t *testing.T) {
 			ctx := context.Background()
 			scheme := resetTestScheme(t)
 			user := &workspacev1.User{
-				ObjectMeta: metav1.ObjectMeta{Name: "cleanup-user", Finalizers: []string{UserFinalizer}},
+				ObjectMeta: metav1.ObjectMeta{Name: "cleanup-user", UID: "cleanup-user-uid", Finalizers: []string{UserFinalizer}},
 				Status:     workspacev1.UserStatus{PersonalNamespace: "personal"},
 			}
-			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "personal"}}
+			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "personal", Labels: map[string]string{LabelManagedByUser: ManagedByValue, LabelUserName: user.Name, LabelPersonalNamespace: LabelValueTrue}, Annotations: map[string]string{AnnotationUserUID: string(user.UID)}}}
 			rb := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "cleanup-user-shared", Namespace: "shared", Labels: map[string]string{LabelManagedByUser: ManagedByValue, LabelUserName: user.Name}}}
 			fail := true
 			cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(user).WithObjects(user, ns, rb).

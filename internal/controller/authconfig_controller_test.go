@@ -171,7 +171,7 @@ var _ = Describe("AuthConfig Controller", func() {
 				Expect(*stored.Spec.LocalAuth.BootstrapAdmin.MustChangePassword).To(Equal(expected))
 
 				userKey := types.NamespacedName{Name: "admin-at-local"}
-				secretKey := types.NamespacedName{Name: "kw-user-admin-at-local-local-auth", Namespace: LocalAuthSystemNamespace}
+				secretKey := types.NamespacedName{Namespace: LocalAuthSystemNamespace}
 				DeferCleanup(func() {
 					user := &kubeworkspacesiov1alpha1.User{}
 					if k8sClient.Get(ctx, userKey, user) == nil {
@@ -188,6 +188,7 @@ var _ = Describe("AuthConfig Controller", func() {
 					Expect(err).NotTo(HaveOccurred())
 					user := &kubeworkspacesiov1alpha1.User{}
 					Expect(k8sClient.Get(ctx, userKey, user)).To(Succeed())
+					secretKey.Name = user.Spec.LocalAuth.PasswordSecretRef.Name
 					Expect(user.Spec.LocalAuth.MustChangePassword).To(Equal(expected))
 					// Bootstrap configuration must not rewrite an existing User's policy.
 					user.Spec.LocalAuth.MustChangePassword = !expected
@@ -197,6 +198,9 @@ var _ = Describe("AuthConfig Controller", func() {
 					Expect(k8sClient.Get(ctx, userKey, user)).To(Succeed())
 					Expect(user.Spec.LocalAuth.MustChangePassword).To(Equal(!expected))
 					Expect(k8sClient.Delete(ctx, user)).To(Succeed())
+					secret := &corev1.Secret{}
+					Expect(k8sClient.Get(ctx, secretKey, secret)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
 				}
 			},
 			Entry("omitted defaults to true", nil, true),
@@ -242,7 +246,7 @@ var _ = Describe("AuthConfig Controller", func() {
 			// Password secret should exist with a bcrypt hash and plaintext password
 			secret := &corev1.Secret{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{
-				Name:      "kw-user-admin-at-local-local-auth",
+				Name:      bootstrapUser.Spec.LocalAuth.PasswordSecretRef.Name,
 				Namespace: LocalAuthSystemNamespace,
 			}, secret)).To(Succeed())
 			Expect(secret.Data).To(HaveKey(PasswordSecretHashKey))
@@ -269,10 +273,12 @@ var _ = Describe("AuthConfig Controller", func() {
 
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: authConfigName}})
 			Expect(err).NotTo(HaveOccurred())
+			bootstrapUser := &kubeworkspacesiov1alpha1.User{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "admin-at-local"}, bootstrapUser)).To(Succeed())
 
 			secretBefore := &corev1.Secret{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{
-				Name:      "kw-user-admin-at-local-local-auth",
+				Name:      bootstrapUser.Spec.LocalAuth.PasswordSecretRef.Name,
 				Namespace: LocalAuthSystemNamespace,
 			}, secretBefore)).To(Succeed())
 			hashBefore := string(secretBefore.Data[PasswordSecretHashKey])
@@ -282,12 +288,11 @@ var _ = Describe("AuthConfig Controller", func() {
 
 			secretAfter := &corev1.Secret{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{
-				Name:      "kw-user-admin-at-local-local-auth",
+				Name:      bootstrapUser.Spec.LocalAuth.PasswordSecretRef.Name,
 				Namespace: LocalAuthSystemNamespace,
 			}, secretAfter)).To(Succeed())
 			Expect(string(secretAfter.Data[PasswordSecretHashKey])).To(Equal(hashBefore))
 
-			bootstrapUser := &kubeworkspacesiov1alpha1.User{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "admin-at-local"}, bootstrapUser)).To(Succeed())
 
 			_ = k8sClient.Delete(ctx, bootstrapUser)
@@ -377,7 +382,7 @@ var _ = Describe("AuthConfig Controller", func() {
 			Expect(updated.Status.Enabled).To(BeTrue())
 			Expect(updated.Status.IssuerReachable).To(BeTrue())
 			Expect(updated.Status.LastVerified).NotTo(BeNil())
-			Expect(updated.Status.Conditions).To(HaveLen(1))
+			Expect(updated.Status.Conditions).To(HaveLen(3))
 			Expect(updated.Status.Conditions[0].Type).To(Equal("Ready"))
 			Expect(updated.Status.Conditions[0].Status).To(Equal(metav1.ConditionTrue))
 			Expect(updated.Status.Conditions[0].Reason).To(Equal("IssuerVerified"))

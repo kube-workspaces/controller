@@ -51,6 +51,8 @@ const (
 	LabelPersonalNamespace = "kubeworkspaces.io/personal-namespace"
 	// AnnotationUserEmail stores the user's email on managed resources.
 	AnnotationUserEmail = "kubeworkspaces.io/user-email"
+	// AnnotationUserUID prevents a replacement User from claiming retained data.
+	AnnotationUserUID = "kubeworkspaces.io/user-uid"
 	// AnnotationNamespaceEnabled marks a namespace as enabled for workspace filtering.
 	AnnotationNamespaceEnabled = "kubeworkspaces.io/namespace-enabled"
 	// ManagedByValue is the value used for the managed-by label.
@@ -174,8 +176,10 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 	// Re-set personalNamespace in case it was just created above
 	if authConfig != nil && authConfig.Spec.PersonalNamespaces != nil && authConfig.Spec.PersonalNamespaces.Enabled {
-		nsName := renderNamespaceTemplate(authConfig.Spec.PersonalNamespaces.Template, user.Name)
-		user.Status.PersonalNamespace = nsName
+		// The persisted namespace is deliberately stable across template changes.
+		if user.Status.PersonalNamespace == "" {
+			user.Status.PersonalNamespace = renderNamespaceTemplate(authConfig.Spec.PersonalNamespaces.Template, user.Name)
+		}
 	}
 	previousStatus := user.DeepCopy().Status
 	readyCondition := metav1.Condition{
@@ -210,6 +214,9 @@ func (r *UserReconciler) getAuthConfig(ctx context.Context) (*kubeworkspacesiov1
 func (r *UserReconciler) reconcilePersonalNamespace(ctx context.Context, user *kubeworkspacesiov1alpha1.User, authConfig *kubeworkspacesiov1alpha1.AuthConfig) (string, error) {
 	nsConfig := authConfig.Spec.PersonalNamespaces
 	nsName := renderNamespaceTemplate(nsConfig.Template, user.Name)
+	if user.Status.PersonalNamespace != "" {
+		nsName = user.Status.PersonalNamespace
+	}
 
 	// Create or update namespace
 	ns := &corev1.Namespace{
@@ -219,28 +226,33 @@ func (r *UserReconciler) reconcilePersonalNamespace(ctx context.Context, user *k
 	}
 
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, ns, func() error {
+		if !ns.CreationTimestamp.IsZero() || ns.ResourceVersion != "" {
+			if !personalNamespaceMatches(ns, user, true) {
+				return fmt.Errorf("namespace %s is not owned by User %s/%s; explicit operator recovery is required", nsName, user.Name, user.UID)
+			}
+		}
 		if ns.Labels == nil {
 			ns.Labels = make(map[string]string)
+		}
+		// Apply additional labels from config
+		for k, v := range nsConfig.Labels {
+			ns.Labels[k] = v
 		}
 		ns.Labels[LabelPersonalNamespace] = LabelValueTrue
 		ns.Labels[LabelUserName] = user.Name
 		ns.Labels[LabelManagedByUser] = ManagedByValue
 
-		// Apply additional labels from config
-		for k, v := range nsConfig.Labels {
-			ns.Labels[k] = v
-		}
-
 		if ns.Annotations == nil {
 			ns.Annotations = make(map[string]string)
 		}
-		ns.Annotations[AnnotationUserEmail] = user.Spec.Email
 		// Ensure personal namespace is enabled for workspace filtering
 		ns.Annotations[AnnotationNamespaceEnabled] = LabelValueTrue
 		// Apply additional annotations from config
 		for k, v := range nsConfig.Annotations {
 			ns.Annotations[k] = v
 		}
+		ns.Annotations[AnnotationUserEmail] = user.Spec.Email
+		ns.Annotations[AnnotationUserUID] = string(user.UID)
 		return nil
 	})
 	if err != nil {
@@ -414,17 +426,36 @@ func (r *UserReconciler) cleanupUser(ctx context.Context, user *kubeworkspacesio
 
 	// Delete personal namespace if it exists
 	if user.Status.PersonalNamespace != "" {
-		ns := &corev1.Namespace{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: user.Status.PersonalNamespace,
-			},
+		ns := &corev1.Namespace{}
+		if err := r.Get(ctx, client.ObjectKey{Name: user.Status.PersonalNamespace}, ns); err != nil {
+			if errors.IsNotFound(err) {
+				return nil
+			}
+			return err
 		}
-		if err := r.Delete(ctx, ns); err != nil && !errors.IsNotFound(err) {
+		// Never delete an unclaimed legacy namespace or another UID's data.
+		if !personalNamespaceMatches(ns, user, false) {
+			return nil
+		}
+		if err := r.Delete(ctx, ns, client.Preconditions{UID: &ns.UID, ResourceVersion: &ns.ResourceVersion}); err != nil && !errors.IsNotFound(err) {
 			return fmt.Errorf("failed to delete personal namespace %s: %w", user.Status.PersonalNamespace, err)
 		}
 	}
 
 	return nil
+}
+
+// Legacy namespaces may be stamped only for their existing status-recorded
+// owner, with matching controller labels and email. Unlabelled namespaces are
+// never adopted merely because a configured template resolves to their name.
+func personalNamespaceMatches(ns *corev1.Namespace, user *kubeworkspacesiov1alpha1.User, allowLegacy bool) bool {
+	if user.UID == "" || !ns.DeletionTimestamp.IsZero() || ns.Labels[LabelManagedByUser] != ManagedByValue || ns.Labels[LabelUserName] != user.Name || ns.Labels[LabelPersonalNamespace] != LabelValueTrue {
+		return false
+	}
+	if uid := ns.Annotations[AnnotationUserUID]; uid != "" {
+		return uid == string(user.UID)
+	}
+	return allowLegacy && user.Status.PersonalNamespace == ns.Name && ns.Annotations[AnnotationUserEmail] == user.Spec.Email
 }
 
 // SetupWithManager sets up the controller with the Manager.
