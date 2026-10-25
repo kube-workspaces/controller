@@ -138,9 +138,38 @@ rules:
   - images
   verbs:
   - create
+  - delete
   - get
   - list
+  - patch
+  - update
   - watch
+- apiGroups:
+  - kubeworkspaces.io
+  resources:
+  - imagerepositories
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - kubeworkspaces.io
+  resources:
+  - imagerepositories/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - kubeworkspaces.io
+  resources:
+  - imagerepositories/status
+  verbs:
+  - get
+  - patch
+  - update
 - apiGroups:
   - kubeworkspaces.io
   resources:
