@@ -18,9 +18,6 @@ package controller
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -41,7 +38,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/yaml"
 
@@ -168,7 +164,11 @@ func (r *ImageRepositoryReconciler) syncRepo(ctx context.Context, repo *kubework
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() {
+		if err := os.RemoveAll(tmpDir); err != nil {
+			log.FromContext(ctx).Error(err, "failed to remove temporary image repository")
+		}
+	}()
 
 	cloneOpts := &git.CloneOptions{
 		URL:      repo.Spec.URL,
@@ -222,77 +222,25 @@ func (r *ImageRepositoryReconciler) syncRepo(ctx context.Context, repo *kubework
 
 	paths := repo.Spec.Paths
 	if len(paths) == 0 {
-		paths = []string{"images/"}
+		paths = []string{"images"}
+	}
+	files, err := imageRepositoryFiles(tmpDir, paths)
+	if err != nil {
+		return nil, err
 	}
 
 	var imported []string
 	desired := map[string]struct{}{}
 
-	for _, scanPath := range paths {
-		fullPath := filepath.Join(tmpDir, scanPath)
-		_ = filepath.Walk(fullPath, func(p string, info os.FileInfo, err error) error {
-			if err != nil || info == nil || info.IsDir() {
-				return nil
-			}
-			if !strings.HasSuffix(p, ".yaml") && !strings.HasSuffix(p, ".yml") {
-				return nil
-			}
-			data, err := os.ReadFile(p)
-			if err != nil {
-				return nil
-			}
-			// try to parse as unstructured
-			var u map[string]interface{}
-			if err := yaml.Unmarshal(data, &u); err != nil {
-				return nil
-			}
-			kind, _ := u["kind"].(string)
-			apiVersion, _ := u["apiVersion"].(string)
-			if kind != "Image" || !strings.Contains(apiVersion, "kubeworkspaces.io") {
-				return nil
-			}
-			metaObj, _ := u["metadata"].(map[string]interface{})
-			name, _ := metaObj["name"].(string)
-			if name == "" {
-				return nil
-			}
-
-			// build object
-			obj := &unstructured.Unstructured{Object: u}
-			labels := obj.GetLabels()
-			if labels == nil {
-				labels = map[string]string{}
-			}
-			labels[imageRepositoryLabelKey] = repo.Name
-			labels[imageRepositoryManagedBy] = imageRepositoryManagedVal
-			obj.SetLabels(labels)
-			ann := obj.GetAnnotations()
-			if ann == nil {
-				ann = map[string]string{}
-			}
-			ann[imageRepositorySourceURL] = repo.Spec.URL
-			ann[imageRepositorySourceRef] = repo.Spec.Ref
-			ann[imageRepositorySourceSHA] = commit
-			ann[imageRepositorySourcePath] = strings.TrimPrefix(p, tmpDir+"/")
-			obj.SetAnnotations(ann)
-
-			existing := &unstructured.Unstructured{}
-			existing.SetGroupVersionKind(schema.GroupVersionKind{Group: "kubeworkspaces.io", Version: "v1alpha1", Kind: "Image"})
-			err = r.Get(ctx, types.NamespacedName{Name: name}, existing)
-			if apierrors.IsNotFound(err) {
-				if err := r.Create(ctx, obj); err != nil {
-					return nil
-				}
-			} else if err == nil {
-				obj.SetResourceVersion(existing.GetResourceVersion())
-				if err := r.Update(ctx, obj); err != nil {
-					return nil
-				}
-			}
+	for _, p := range files {
+		name, err := r.syncImageFile(ctx, repo, commit, tmpDir, p)
+		if err != nil {
+			return nil, fmt.Errorf("sync %s: %w", strings.TrimPrefix(p, tmpDir+"/"), err)
+		}
+		if name != "" {
 			imported = append(imported, name)
 			desired[name] = struct{}{}
-			return nil
-		})
+		}
 	}
 
 	// GC
@@ -317,12 +265,86 @@ func (r *ImageRepositoryReconciler) syncRepo(ctx context.Context, repo *kubework
 		}
 	}
 
-	res := &syncResult{commit: commit, imported: uniq}
-	_, _ = json.Marshal(res)
-	_ = sha256.Sum256([]byte(commit))
-	_ = hex.EncodeToString([]byte{})
-	_ = controllerutil.AddFinalizer
-	return res, nil
+	return &syncResult{commit: commit, imported: uniq}, nil
+}
+
+// syncImageFile imports one manifest and returns its name, or an empty name for
+// documents that are not named Images.
+func (r *ImageRepositoryReconciler) syncImageFile(ctx context.Context, repo *kubeworkspacesiov1alpha1.ImageRepository, commit, root, path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	var u map[string]interface{}
+	if err := yaml.Unmarshal(data, &u); err != nil {
+		return "", fmt.Errorf("parse %s: %w", path, err)
+	}
+	kind, _ := u["kind"].(string)
+	apiVersion, _ := u["apiVersion"].(string)
+	if kind != "Image" || !strings.Contains(apiVersion, "kubeworkspaces.io") {
+		return "", nil
+	}
+	obj := &unstructured.Unstructured{Object: u}
+	name := obj.GetName()
+	if name == "" {
+		return "", nil
+	}
+	labels := obj.GetLabels()
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	labels[imageRepositoryLabelKey] = repo.Name
+	labels[imageRepositoryManagedBy] = imageRepositoryManagedVal
+	obj.SetLabels(labels)
+	ann := obj.GetAnnotations()
+	if ann == nil {
+		ann = map[string]string{}
+	}
+	ann[imageRepositorySourceURL] = repo.Spec.URL
+	ann[imageRepositorySourceRef] = repo.Spec.Ref
+	ann[imageRepositorySourceSHA] = commit
+	ann[imageRepositorySourcePath] = strings.TrimPrefix(path, root+"/")
+	obj.SetAnnotations(ann)
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(schema.GroupVersionKind{Group: "kubeworkspaces.io", Version: "v1alpha1", Kind: "Image"})
+	err = r.Get(ctx, types.NamespacedName{Name: name}, existing)
+	if apierrors.IsNotFound(err) {
+		err = r.Create(ctx, obj)
+	} else if err == nil {
+		obj.SetResourceVersion(existing.GetResourceVersion())
+		err = r.Update(ctx, obj)
+	}
+	if err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+// imageRepositoryFiles lists only direct YAML children of each configured
+// directory. ReadDir accepts paths with or without a trailing slash. Resolve all
+// directories before importing so a missing path fails the sync without pruning.
+func imageRepositoryFiles(root string, paths []string) ([]string, error) {
+	var files []string
+	seen := map[string]bool{}
+	for _, scanPath := range paths {
+		fullPath := filepath.Join(root, strings.TrimSpace(scanPath))
+		entries, err := os.ReadDir(fullPath)
+		if err != nil {
+			return nil, fmt.Errorf("read image directory %q: %w", scanPath, err)
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || (!strings.HasSuffix(entry.Name(), ".yaml") && !strings.HasSuffix(entry.Name(), ".yml")) {
+				continue
+			}
+			path := filepath.Join(fullPath, entry.Name())
+			if !seen[path] {
+				files = append(files, path)
+				seen[path] = true
+			}
+		}
+	}
+	return files, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

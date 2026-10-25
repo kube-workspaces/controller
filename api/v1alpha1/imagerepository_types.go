@@ -29,7 +29,8 @@ type ImageRepositorySpec struct {
 	// +optional
 	Ref string `json:"ref,omitempty"`
 	// Paths are directories in the repo to scan for Image CR YAML files (relative to repo root).
-	// If empty, defaults to ["images/"].
+	// Only files directly in each directory are scanned; subdirectories must be listed separately.
+	// A trailing slash is optional. If empty, defaults to ["images"].
 	// +optional
 	Paths []string `json:"paths,omitempty"`
 	// Auth config for private repos.
