@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,10 +38,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/yaml"
 
 	kubeworkspacesiov1alpha1 "github.com/kube-workspaces/controller/api/v1alpha1"
@@ -90,7 +94,7 @@ func (r *ImageRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			LastTransitionTime: metav1.Now(),
 		})
 		_ = r.Status().Update(ctx, &repo)
-		return ctrl.Result{RequeueAfter: defaultSyncInterval}, nil
+		return ctrl.Result{}, nil
 	}
 
 	// Manual sync trigger via annotation
@@ -125,7 +129,8 @@ func (r *ImageRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		})
 		repo.Status.ObservedGeneration = repo.Generation
 		_ = r.Status().Update(ctx, &repo)
-		return ctrl.Result{RequeueAfter: time.Minute}, nil
+		// Returning the error uses controller-runtime's exponential retry backoff.
+		return ctrl.Result{}, err
 	}
 
 	// Clear sync annotation if present
@@ -149,17 +154,32 @@ func (r *ImageRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		Message:            fmt.Sprintf("Synced %d image(s)", len(result.imported)),
 		LastTransitionTime: metav1.Now(),
 	})
+	if len(result.invalid) > 0 {
+		// Keep diagnostics bounded. Raw API errors may contain manifest values.
+		meta.SetStatusCondition(&repo.Status.Conditions, metav1.Condition{
+			Type: "Ready", Status: metav1.ConditionFalse, Reason: "InvalidManifests",
+			Message:            fmt.Sprintf("Skipped %d invalid manifest(s); pruning withheld. First invalid file: %.200s", len(result.invalid), result.invalid[0]),
+			LastTransitionTime: metav1.Now(),
+		})
+	}
 	if err := r.Status().Update(ctx, &repo); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{RequeueAfter: interval}, nil
+	return ctrl.Result{RequeueAfter: wait.Jitter(interval, 0.2)}, nil
 }
 
 type syncResult struct {
 	commit   string
 	imported []string
+	invalid  []string
 }
+
+// invalidImageManifest distinguishes malformed source files from cluster failures.
+type invalidImageManifest struct{ err error }
+
+func (e *invalidImageManifest) Error() string { return e.err.Error() }
+func (e *invalidImageManifest) Unwrap() error { return e.err }
 
 func (r *ImageRepositoryReconciler) syncRepo(ctx context.Context, repo *kubeworkspacesiov1alpha1.ImageRepository) (*syncResult, error) {
 	tmpDir, err := os.MkdirTemp("", "imagerepo-")
@@ -178,40 +198,23 @@ func (r *ImageRepositoryReconciler) syncRepo(ctx context.Context, repo *kubework
 		Depth:    1,
 	}
 	if repo.Spec.Ref != "" {
-		cloneOpts.ReferenceName = plumbing.NewBranchReferenceName(repo.Spec.Ref)
-		if strings.Contains(repo.Spec.Ref, "/") || strings.HasPrefix(repo.Spec.Ref, "refs/") {
-			cloneOpts.ReferenceName = plumbing.ReferenceName(repo.Spec.Ref)
-		}
+		// Fetch history/refs when a branch, tag or commit is explicitly requested.
+		// Never silently sync the default branch when a requested ref is absent.
+		cloneOpts.Depth = 0
 	}
 
-	var auth transport.AuthMethod
-	if repo.Spec.Auth != nil && repo.Spec.Auth.SecretRef != nil {
-		var secret corev1.Secret
-		if err := r.Get(ctx, types.NamespacedName{Name: repo.Spec.Auth.SecretRef.Name, Namespace: "kube-workspaces-system"}, &secret); err != nil {
-			// try default namespace
-			if err2 := r.Get(ctx, types.NamespacedName{Name: repo.Spec.Auth.SecretRef.Name, Namespace: "default"}, &secret); err2 != nil {
-				return nil, fmt.Errorf("failed to get auth secret: %w", err)
-			}
-		}
-		username := string(secret.Data["username"])
-		password := string(secret.Data["password"])
-		if password == "" {
-			password = string(secret.Data["token"])
-		}
-		if username == "" {
-			username = "git"
-		}
-		auth = &http.BasicAuth{Username: username, Password: password}
-		cloneOpts.Auth = auth
+	cloneOpts.Auth, err = r.imageRepositoryAuth(ctx, repo)
+	if err != nil {
+		return nil, err
 	}
 
 	repoClone, err := git.PlainCloneContext(ctx, tmpDir, false, cloneOpts)
 	if err != nil {
-		// try without branch ref
-		cloneOpts.ReferenceName = ""
-		cloneOpts.Depth = 1
-		repoClone, err = git.PlainCloneContext(ctx, tmpDir, false, cloneOpts)
-		if err != nil {
+		// Git transport errors can include credentials from the remote URL.
+		return nil, fmt.Errorf("failed to clone repository; check URL and credentials")
+	}
+	if repo.Spec.Ref != "" {
+		if err := checkoutImageRepositoryRef(repoClone, repo.Spec.Ref); err != nil {
 			return nil, err
 		}
 	}
@@ -232,11 +235,17 @@ func (r *ImageRepositoryReconciler) syncRepo(ctx context.Context, repo *kubework
 	}
 
 	var imported []string
+	var invalid []string
 	desired := map[string]struct{}{}
 
 	for _, p := range files {
 		name, err := r.syncImageFile(ctx, repo, commit, tmpDir, p)
 		if err != nil {
+			var manifestErr *invalidImageManifest
+			if errors.As(err, &manifestErr) || apierrors.IsInvalid(err) || apierrors.IsBadRequest(err) {
+				invalid = append(invalid, strings.TrimPrefix(p, tmpDir+"/"))
+				continue
+			}
 			return nil, fmt.Errorf("sync %s: %w", strings.TrimPrefix(p, tmpDir+"/"), err)
 		}
 		if name != "" {
@@ -253,6 +262,9 @@ func (r *ImageRepositoryReconciler) syncRepo(ctx context.Context, repo *kubework
 		return nil, fmt.Errorf("list images for pruning: %w", err)
 	}
 	for i := range list.Items {
+		if len(invalid) > 0 {
+			break // An incomplete inventory must never remove existing images.
+		}
 		image := &list.Items[i]
 		if _, ok := desired[image.GetName()]; !ok {
 			// A concurrent adoption/update must not be deleted using a stale list.
@@ -273,7 +285,54 @@ func (r *ImageRepositoryReconciler) syncRepo(ctx context.Context, repo *kubework
 		}
 	}
 
-	return &syncResult{commit: commit, imported: uniq}, nil
+	return &syncResult{commit: commit, imported: uniq, invalid: invalid}, nil
+}
+
+func (r *ImageRepositoryReconciler) imageRepositoryAuth(ctx context.Context, repo *kubeworkspacesiov1alpha1.ImageRepository) (transport.AuthMethod, error) {
+	if repo.Spec.Auth == nil {
+		return nil, nil
+	}
+	if authType := repo.Spec.Auth.Type; authType != "" && authType != "basic" && authType != "https-basic" {
+		return nil, fmt.Errorf("unsupported authentication type; use HTTPS basic authentication")
+	}
+	if repo.Spec.Auth.SecretRef == nil {
+		return nil, nil
+	}
+	var secret corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Name: repo.Spec.Auth.SecretRef.Name, Namespace: "kube-workspaces-system"}, &secret); err != nil {
+		// Preserve the historical default-namespace fallback.
+		if err2 := r.Get(ctx, types.NamespacedName{Name: repo.Spec.Auth.SecretRef.Name, Namespace: "default"}, &secret); err2 != nil {
+			return nil, fmt.Errorf("failed to get auth secret: %w", err)
+		}
+	}
+	username := string(secret.Data["username"])
+	password := string(secret.Data["password"])
+	if password == "" {
+		password = string(secret.Data["token"])
+	}
+	if username == "" {
+		username = "git"
+	}
+	return &http.BasicAuth{Username: username, Password: password}, nil
+}
+
+func checkoutImageRepositoryRef(repository *git.Repository, ref string) error {
+	hash, err := repository.ResolveRevision(plumbing.Revision(ref))
+	if err != nil {
+		// Non-default branches of a clone live under refs/remotes/origin.
+		hash, err = repository.ResolveRevision(plumbing.Revision("refs/remotes/origin/" + ref))
+	}
+	if err != nil {
+		return fmt.Errorf("requested git ref could not be resolved")
+	}
+	worktree, err := repository.Worktree()
+	if err != nil {
+		return fmt.Errorf("failed to open repository worktree")
+	}
+	if err := worktree.Checkout(&git.CheckoutOptions{Hash: *hash}); err != nil {
+		return fmt.Errorf("failed to check out requested git ref")
+	}
+	return nil
 }
 
 // syncImageFile imports one manifest and returns its name, or an empty name for
@@ -285,23 +344,26 @@ func (r *ImageRepositoryReconciler) syncImageFile(ctx context.Context, repo *kub
 	}
 	jsonData, err := yaml.YAMLToJSON(data)
 	if err != nil {
-		return "", fmt.Errorf("parse %s: %w", path, err)
+		return "", &invalidImageManifest{err: err}
 	}
 	// Use Kubernetes' JSON decoder to preserve integer fields. Generic YAML/JSON
 	// decoding turns numbers into float64 and makes unchanged specs look modified.
 	obj := &unstructured.Unstructured{}
 	if err := obj.UnmarshalJSON(jsonData); err != nil {
-		return "", fmt.Errorf("parse %s: %w", path, err)
+		return "", &invalidImageManifest{err: err}
 	}
-	if obj.GetKind() != "Image" || obj.GroupVersionKind().Group != "kubeworkspaces.io" {
+	if obj.GetKind() != "Image" {
 		return "", nil
+	}
+	if obj.GetAPIVersion() != "kubeworkspaces.io/v1alpha1" {
+		return "", &invalidImageManifest{err: fmt.Errorf("unsupported Image apiVersion")}
 	}
 	name := obj.GetName()
 	if name == "" {
-		return "", nil
+		return "", &invalidImageManifest{err: fmt.Errorf("image name is required")}
 	}
 	if _, ok := obj.Object["spec"].(map[string]interface{}); !ok {
-		return "", fmt.Errorf("image %s is missing a spec object", name)
+		return "", &invalidImageManifest{err: fmt.Errorf("image %s is missing a spec object", name)}
 	}
 	labels := obj.GetLabels()
 	if labels == nil {
@@ -371,7 +433,14 @@ func imageRepositoryFiles(root string, paths []string) ([]string, error) {
 	var files []string
 	seen := map[string]bool{}
 	for _, scanPath := range paths {
-		fullPath := filepath.Join(root, strings.TrimSpace(scanPath))
+		scanPath = strings.TrimSpace(scanPath)
+		if scanPath == "" || filepath.IsAbs(scanPath) {
+			return nil, fmt.Errorf("image directory must be relative to the repository")
+		}
+		fullPath, err := containedImageRepositoryPath(root, filepath.Join(root, scanPath))
+		if err != nil {
+			return nil, err
+		}
 		entries, err := os.ReadDir(fullPath)
 		if err != nil {
 			return nil, fmt.Errorf("read image directory %q: %w", scanPath, err)
@@ -381,6 +450,9 @@ func imageRepositoryFiles(root string, paths []string) ([]string, error) {
 				continue
 			}
 			path := filepath.Join(fullPath, entry.Name())
+			if _, err := containedImageRepositoryPath(root, path); err != nil {
+				return nil, err
+			}
 			if !seen[path] {
 				files = append(files, path)
 				seen[path] = true
@@ -390,9 +462,34 @@ func imageRepositoryFiles(root string, paths []string) ([]string, error) {
 	return files, nil
 }
 
+func containedImageRepositoryPath(root, path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve image repository path: %w", err)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(resolvedRoot, resolved)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("image path escapes the repository")
+	}
+	return path, nil
+}
+
+func imageRepositoryPredicate() predicate.Predicate {
+	return predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
+		return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() ||
+			(e.ObjectNew.GetAnnotations()[imageRepositorySyncAnno] != "" &&
+				e.ObjectOld.GetAnnotations()[imageRepositorySyncAnno] != e.ObjectNew.GetAnnotations()[imageRepositorySyncAnno])
+	}}
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *ImageRepositoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&kubeworkspacesiov1alpha1.ImageRepository{}).
+		WithEventFilter(imageRepositoryPredicate()).
 		Complete(r)
 }

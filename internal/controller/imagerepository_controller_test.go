@@ -10,8 +10,11 @@ import (
 	"time"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/plumbing/transport/http"
 	workspacev1 "github.com/kube-workspaces/controller/api/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -19,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 )
 
 func TestImageRepositoryFiles(t *testing.T) {
@@ -263,5 +267,121 @@ func TestImageRepositoryPrunesOnlyOwnedImages(t *testing.T) {
 	}
 	if err := cl.Get(context.Background(), client.ObjectKey{Name: "removed"}, &workspacev1.Image{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("removed image was not pruned: %v", err)
+	}
+}
+
+func TestImageRepositoryRejectsEscapingPaths(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "outside.yaml"), []byte(repositoryImageManifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "images"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "outside.yaml"), filepath.Join(root, "images", "link.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(root, outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{outside, relative, "linked", "images", ""} {
+		t.Run(path, func(t *testing.T) {
+			if files, err := imageRepositoryFiles(root, []string{path}); err == nil || files != nil {
+				t.Fatalf("escaping path must fail without an inventory: files=%v err=%v", files, err)
+			}
+		})
+	}
+}
+
+func TestImageRepositoryGitRefs(t *testing.T) {
+	repo := localGitImageRepository(t)
+	repository, err := git.PlainOpen(repo.Spec.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := repository.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.CreateTag("catalog-v1", head.Hash(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Storer.SetReference(plumbing.NewHashReference(plumbing.NewBranchReferenceName("feature/catalog"), head.Hash())); err != nil {
+		t.Fatal(err)
+	}
+	for _, ref := range []string{head.Name().Short(), "feature/catalog", "refs/tags/catalog-v1", "catalog-v1", head.Hash().String(), "missing-ref"} {
+		t.Run(ref, func(t *testing.T) {
+			repo.Spec.Ref = ref
+			cl := fake.NewClientBuilder().WithScheme(resetTestScheme(t)).Build()
+			r := &ImageRepositoryReconciler{Client: cl}
+			result, err := r.syncRepo(context.Background(), repo)
+			if ref == "missing-ref" {
+				if err == nil {
+					t.Fatal("missing ref must fail rather than syncing the default branch")
+				}
+				return
+			}
+			if err != nil || result.commit != head.Hash().String() {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+		})
+	}
+}
+
+func TestImageRepositoryIgnoresStatusOnlyUpdates(t *testing.T) {
+	old := &workspacev1.ImageRepository{ObjectMeta: metav1.ObjectMeta{Generation: 1}}
+	updated := old.DeepCopy()
+	updated.Status.LastSyncTime = &metav1.Time{Time: time.Now()}
+	p := imageRepositoryPredicate()
+	if p.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: updated}) {
+		t.Fatal("status updates must not bypass scheduling/backoff")
+	}
+	updated.Generation++
+	if !p.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: updated}) {
+		t.Fatal("spec changes must reconcile immediately")
+	}
+	updated.Generation = old.Generation
+	updated.Annotations = map[string]string{imageRepositorySyncAnno: "now"}
+	if !p.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: updated}) {
+		t.Fatal("manual sync must reconcile immediately")
+	}
+	if p.Update(event.UpdateEvent{ObjectOld: updated, ObjectNew: old}) {
+		t.Fatal("clearing a completed trigger must not immediately re-sync")
+	}
+}
+
+func TestImageRepositorySecretAuthentication(t *testing.T) {
+	for _, test := range []struct {
+		name, namespace, authType, username, password, token, wantUser, wantPassword string
+	}{
+		{"password", "kube-workspaces-system", "basic", "catalog-user", "password-value", "ignored-token", "catalog-user", "password-value"},
+		{"token and default user", "kube-workspaces-system", "https-basic", "", "", "token-value", "git", "token-value"},
+		{"legacy namespace", "default", "", "legacy", "", "legacy-token", "legacy", "legacy-token"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "catalog-auth", Namespace: test.namespace}, Data: map[string][]byte{
+				"username": []byte(test.username), "password": []byte(test.password), "token": []byte(test.token),
+			}}
+			cl := fake.NewClientBuilder().WithScheme(resetTestScheme(t)).WithObjects(secret).Build()
+			r := &ImageRepositoryReconciler{Client: cl}
+			repo := &workspacev1.ImageRepository{Spec: workspacev1.ImageRepositorySpec{Auth: &workspacev1.ImageRepositoryAuth{Type: test.authType, SecretRef: &corev1.LocalObjectReference{Name: secret.Name}}}}
+			auth, err := r.imageRepositoryAuth(context.Background(), repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			basic, ok := auth.(*http.BasicAuth)
+			if !ok || basic.Username != test.wantUser || basic.Password != test.wantPassword {
+				t.Fatal("credentials were not read from the referenced Secret")
+			}
+			repo.Spec.Auth.Type = "ssh"
+			if _, err := r.imageRepositoryAuth(context.Background(), repo); err == nil {
+				t.Fatal("unsupported SSH auth must not silently use HTTP credentials")
+			}
+		})
 	}
 }
