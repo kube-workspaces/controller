@@ -3,8 +3,10 @@ package controller
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"reflect"
+	"regexp"
 	"strings"
 
 	workspacev1 "github.com/kube-workspaces/controller/api/v1alpha1"
@@ -30,6 +32,31 @@ const (
 	containerInitHash       = "kubeworkspaces.io/container-init-data-hash"
 )
 
+var containerInitAccountName = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+
+func validateContainerInitIdentity(cfg *workspacev1.ContainerInitSpec) error {
+	if (cfg.DefaultUser != "" || cfg.RunAsUser != "") && cfg.Mode != containerInitInjected {
+		return fmt.Errorf("container initialization identity options require injected mode")
+	}
+	for _, name := range []string{cfg.DefaultUser, cfg.RunAsUser} {
+		if name != "" && !containerInitAccountName.MatchString(name) {
+			return fmt.Errorf("container initialization identity must be a valid account name")
+		}
+	}
+	if cfg.RunAsUser == "root" {
+		return fmt.Errorf("container initialization runAsUser must be non-root")
+	}
+	return nil
+}
+
+func containerInitPullPolicy(image string) corev1.PullPolicy {
+	name := image[strings.LastIndex(image, "/")+1:]
+	if !strings.Contains(image, "@") && (strings.HasSuffix(name, ":latest") || !strings.Contains(name, ":")) {
+		return corev1.PullAlways
+	}
+	return corev1.PullIfNotPresent
+}
+
 func containerInitSecretName(name string) string {
 	if len(name) > 230 {
 		sum := sha256.Sum256([]byte(name))
@@ -48,6 +75,9 @@ func (r *WorkspaceReconciler) prepareContainerInit(ctx context.Context, ws *work
 	}
 	if cfg.Mode != containerInitInjected && cfg.Mode != containerInitBakedIn {
 		return fmt.Errorf("unsupported container initialization mode")
+	}
+	if err := validateContainerInitIdentity(cfg); err != nil {
+		return err
 	}
 	if workspaceTypeOf(ws) == WorkspaceTypeVM {
 		return fmt.Errorf("container initialization cannot be used for a VM")
@@ -102,18 +132,59 @@ func (r *WorkspaceReconciler) prepareContainerInit(ctx context.Context, ws *work
 	}
 	argv := append(append([]string{}, main.Command...), main.Args...)
 	main.Command = []string{containerInitBinPath + "/container-init"}
-	main.Args = append([]string{"--user-data", containerInitDataPath + "/" + containerInitDataKey, "--"}, argv...)
+	if main.TerminationMessagePath == "" {
+		main.TerminationMessagePath = "/dev/termination-log"
+	}
+	if main.TerminationMessagePolicy == "" {
+		main.TerminationMessagePolicy = corev1.TerminationMessageReadFile
+	}
+	main.Args = []string{"--user-data", containerInitDataPath + "/" + containerInitDataKey, "--termination-message", main.TerminationMessagePath}
+	if cfg.DefaultUser != "" {
+		main.Args = append(main.Args, "--default-user", cfg.DefaultUser)
+	}
+	if cfg.RunAsUser != "" {
+		main.Args = append(main.Args, "--run-as", cfg.RunAsUser)
+	}
+	main.Args = append(append(main.Args, "--"), argv...)
 	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{Name: containerInitBinVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
 	main.VolumeMounts = append(main.VolumeMounts, corev1.VolumeMount{Name: containerInitBinVolume, MountPath: containerInitBinPath, ReadOnly: true})
 	uid := int64(0)
 	readOnly := true
 	pod.Spec.InitContainers = append(pod.Spec.InitContainers, corev1.Container{
-		Name: containerInitInstaller, Image: r.ContainerInitImage, ImagePullPolicy: corev1.PullIfNotPresent,
+		Name: containerInitInstaller, Image: r.ContainerInitImage, ImagePullPolicy: containerInitPullPolicy(r.ContainerInitImage),
 		Command:         []string{"/bin/sh", "-c", "cp /usr/local/bin/container-init /install/container-init && chmod 0755 /install/container-init"},
 		VolumeMounts:    []corev1.VolumeMount{{Name: containerInitBinVolume, MountPath: "/install"}},
 		SecurityContext: &corev1.SecurityContext{RunAsUser: &uid, ReadOnlyRootFilesystem: &readOnly},
 	})
 	return nil
+}
+
+var containerInitFailureStep = regexp.MustCompile(`^(preflight|handoff|package_update|package_upgrade|packages|ssh_authorized_keys|ca_certs|timezone|(bootcmd|write_files|runcmd|groups|users|chpasswd\.users)\[[0-9]+\]|users\[[0-9]+\]\.lock_passwd)$`)
+
+// Only recognize the runner's structured, payload-free failure contract. Never
+// copy arbitrary application/tool output into an initialization condition.
+func containerInitFailureCondition(ws *workspacev1.Workspace, pod *corev1.Pod) *workspacev1.WorkspaceCondition {
+	if ws.Spec.ContainerInit == nil || ws.Spec.ContainerInit.Mode != containerInitInjected || len(pod.Status.ContainerStatuses) == 0 {
+		return nil
+	}
+	s := pod.Status.ContainerStatuses[0]
+	terminated := s.State.Terminated
+	if s.State.Waiting != nil {
+		terminated = s.LastTerminationState.Terminated
+	}
+	if terminated == nil || terminated.ExitCode == 0 {
+		return nil
+	}
+	var diagnostic struct {
+		Source  string `json:"source"`
+		Version int    `json:"version"`
+		State   string `json:"state"`
+		Step    string `json:"step"`
+	}
+	if len(terminated.Message) > 1024 || json.Unmarshal([]byte(terminated.Message), &diagnostic) != nil || diagnostic.Source != "container-init" || diagnostic.Version != 1 || diagnostic.State != "failed" || !containerInitFailureStep.MatchString(diagnostic.Step) {
+		return nil
+	}
+	return &workspacev1.WorkspaceCondition{Type: "ContainerInitialized", Status: "False", Reason: "ContainerInitFailed", Message: "Container initialization failed during " + diagnostic.Step + "; inspect the main container logs.", LastTransitionTime: terminated.FinishedAt}
 }
 
 func (r *WorkspaceReconciler) containerInitData(ctx context.Context, ws *workspacev1.Workspace) (string, []byte, error) {

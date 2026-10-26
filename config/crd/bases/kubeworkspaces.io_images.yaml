@@ -104,6 +104,11 @@ spec:
                   DefaultContainerInit opts container/scratch workspaces into initialization.
                   DefaultUserData alone does not enable container initialization.
                 properties:
+                  defaultUser:
+                    description: 'DefaultUser explicitly resolves users: default and
+                      top-level SSH keys.'
+                    pattern: ^[a-z_][a-z0-9_-]{0,31}$
+                    type: string
                   mode:
                     description: |-
                       Mode selects normal startup, injected entrypoint wrapping, or data-only
@@ -113,9 +118,21 @@ spec:
                     - injected
                     - baked-in
                     type: string
+                  runAsUser:
+                    description: |-
+                      RunAsUser drops privileges after provisioning, before application exec.
+                      The resolved account must be non-root. Injected mode only.
+                    pattern: ^[a-z_][a-z0-9_-]{0,31}$
+                    type: string
                 required:
                 - mode
                 type: object
+                x-kubernetes-validations:
+                - message: Identity options require injected mode
+                  rule: (!has(self.defaultUser) && !has(self.runAsUser)) || self.mode
+                    == 'injected'
+                - message: runAsUser must be non-root
+                  rule: '!has(self.runAsUser) || self.runAsUser != ''root'''
               defaultCredentials:
                 description: DefaultCredentials are the default login credentials
                   for this image.

@@ -40,6 +40,8 @@ func TestContainerInitBothWorkloadsPreserveOriginalAndSecretOwnership(t *testing
 	for _, kind := range []string{"container", "scratch"} {
 		t.Run(kind, func(t *testing.T) {
 			r, ws := containerInitFixture(t)
+			group := int64(1234)
+			ws.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{FSGroup: &group}
 			ws.Spec.Type = kind
 			original := ws.DeepCopy()
 			var first *corev1.PodTemplateSpec
@@ -53,12 +55,15 @@ func TestContainerInitBothWorkloadsPreserveOriginalAndSecretOwnership(t *testing
 				if err := r.prepareContainerInit(context.Background(), ws, pod); err != nil {
 					t.Fatal(err)
 				}
+				if !reflect.DeepEqual(pod.Spec.SecurityContext, ws.Spec.Template.Spec.SecurityContext) {
+					t.Fatal("pod security context/fsGroup changed during injection")
+				}
 				if first != nil && !reflect.DeepEqual(first, pod) {
 					t.Fatal("reconciliation changed the generated template or accumulated injection")
 				}
 				first = pod
 				main := pod.Spec.Containers[0]
-				want := []string{"--user-data", "/run/container-init/user-data", "--", "app", "a b", "", "$HOME"}
+				want := []string{"--user-data", "/run/container-init/user-data", "--termination-message", "/dev/termination-log", "--", "app", "a b", "", "$HOME"}
 				if !reflect.DeepEqual(main.Args, want) || !reflect.DeepEqual(main.Command, []string{"/opt/container-init/container-init"}) {
 					t.Fatalf("application argv not preserved: %#v", main)
 				}
@@ -89,6 +94,77 @@ func TestContainerInitBothWorkloadsPreserveOriginalAndSecretOwnership(t *testing
 				t.Fatal("clone reused the source's generated Secret")
 			}
 		})
+	}
+}
+
+func TestContainerInitIdentityArguments(t *testing.T) {
+	r, ws := containerInitFixture(t)
+	ws.Spec.ContainerInit.DefaultUser = "developer"
+	ws.Spec.ContainerInit.RunAsUser = "app"
+	pod := &generateStatefulSet(ws).Spec.Template
+	if err := r.prepareContainerInit(context.Background(), ws, pod); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"--user-data", "/run/container-init/user-data", "--termination-message", "/dev/termination-log", "--default-user", "developer", "--run-as", "app", "--"}
+	if len(pod.Spec.Containers[0].Args) < len(want) || !reflect.DeepEqual(pod.Spec.Containers[0].Args[:len(want)], want) {
+		t.Fatalf("identity flags lost: %v", pod.Spec.Containers[0].Args)
+	}
+	ws.Spec.ContainerInit.RunAsUser = "root"
+	if err := r.prepareContainerInit(context.Background(), ws, &generateStatefulSet(ws).Spec.Template); err == nil {
+		t.Fatal("root privilege-drop request accepted")
+	}
+}
+
+func TestContainerInitLatestPullPolicy(t *testing.T) {
+	for _, image := range []string{"ghcr.io/example/installer:latest", "registry:5000/installer", "ghcr.io/example/installer:sha-123", "ghcr.io/example/installer@sha256:123"} {
+		r, ws := containerInitFixture(t)
+		r.ContainerInitImage = image
+		pod := &generateStatefulSet(ws).Spec.Template
+		if err := r.prepareContainerInit(context.Background(), ws, pod); err != nil {
+			t.Fatal(err)
+		}
+		policy := pod.Spec.InitContainers[len(pod.Spec.InitContainers)-1].ImagePullPolicy
+		want := corev1.PullIfNotPresent
+		if strings.HasSuffix(image, ":latest") || image == "registry:5000/installer" {
+			want = corev1.PullAlways
+		}
+		if policy != want {
+			t.Fatalf("%s: got %s want %s", image, policy, want)
+		}
+	}
+}
+
+func TestContainerInitPreservesTerminationMessageSettings(t *testing.T) {
+	const path = "/run/custom-termination"
+	r, ws := containerInitFixture(t)
+	ws.Spec.Template.Spec.Containers[0].TerminationMessagePath = path
+	ws.Spec.Template.Spec.Containers[0].TerminationMessagePolicy = corev1.TerminationMessageFallbackToLogsOnError
+	pod := &generateStatefulSet(ws).Spec.Template
+	if err := r.prepareContainerInit(context.Background(), ws, pod); err != nil {
+		t.Fatal(err)
+	}
+	main := pod.Spec.Containers[0]
+	if main.Args[3] != path || main.TerminationMessagePath != path || main.TerminationMessagePolicy != corev1.TerminationMessageFallbackToLogsOnError {
+		t.Fatal("explicit termination message settings overwritten")
+	}
+}
+
+func TestContainerInitFailureConditionRejectsPayloadsAndStaleFailure(t *testing.T) {
+	_, ws := containerInitFixture(t)
+	for _, message := range []string{`{"source":"container-init","version":1,"state":"failed","step":"runcmd[0]"}`, `{"source":"container-init","version":1,"state":"failed","step":"do-not-print-me"}`, "arbitrary tool output"} {
+		pod := &corev1.Pod{Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}}, LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Message: message}}}}}}
+		condition := containerInitFailureCondition(ws, pod)
+		if strings.Contains(message, "runcmd[0]") {
+			if condition == nil || condition.Reason != "ContainerInitFailed" || !strings.Contains(condition.Message, "runcmd[0]") {
+				t.Fatal("missing failure condition")
+			}
+		} else if condition != nil {
+			t.Fatal("untrusted message accepted as failure phase")
+		}
+		pod.Status.ContainerStatuses[0].State = corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}
+		if containerInitFailureCondition(ws, pod) != nil {
+			t.Fatal("previous attempt failure leaked into running retry")
+		}
 	}
 }
 

@@ -980,6 +980,9 @@ func (r *WorkspaceReconciler) updateWorkspaceStatus(ctx context.Context,
 			condition := podCondToWorkspaceCondition(pod.Status.Conditions[i])
 			status.Conditions = append(status.Conditions, condition)
 		}
+		if condition := containerInitFailureCondition(ws, pod); condition != nil {
+			status.Conditions = append(status.Conditions, *condition)
+		}
 	}
 
 	if windowsWorkspace(ws) {

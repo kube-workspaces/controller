@@ -55,11 +55,21 @@ spec:
                   ContainerInit is resolved at creation and applied to the main container.
                   Direct Workspace CRs can supply it without an Image catalog lookup.
                 properties:
+                  defaultUser:
+                    description: 'DefaultUser explicitly resolves users: default and
+                      top-level SSH keys.'
+                    pattern: ^[a-z_][a-z0-9_-]{0,31}$
+                    type: string
                   mode:
                     enum:
                     - disabled
                     - injected
                     - baked-in
+                    type: string
+                  runAsUser:
+                    description: RunAsUser is an explicit non-root account for application
+                      exec after setup.
+                    pattern: ^[a-z_][a-z0-9_-]{0,31}$
                     type: string
                   userData:
                     description: |-
@@ -95,6 +105,11 @@ spec:
                 - message: Enabled container initialization requires user-data
                   rule: self.mode == 'disabled' || (has(self.userData) && size(self.userData)
                     > 0) || has(self.userDataSecretRef)
+                - message: Identity options require injected mode
+                  rule: (!has(self.defaultUser) && !has(self.runAsUser)) || self.mode
+                    == 'injected'
+                - message: runAsUser must be non-root
+                  rule: '!has(self.runAsUser) || self.runAsUser != ''root'''
               executionRevocationEpoch:
                 default: 0
                 description: |-
