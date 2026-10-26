@@ -100,6 +100,9 @@ func main() {
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
 	var managementBootstrapNamespace string
+	var containerInitImage string
+	flag.StringVar(&containerInitImage, "container-init-image", os.Getenv("KW_CONTAINER_INIT_IMAGE"),
+		"Pinned installer image for opt-in container-init injection; empty disables injected mode")
 	flag.StringVar(&managementBootstrapNamespace, "management-bootstrap-namespace",
 		os.Getenv("KW_MANAGEMENT_BOOTSTRAP_NAMESPACE"),
 		"Protected namespace for opt-in management bootstrap Secrets; empty disables provisioning")
@@ -268,6 +271,7 @@ func main() {
 		EventRecorder:                mgr.GetEventRecorderFor("workspace-controller"),
 		APIReader:                    mgr.GetAPIReader(),
 		ManagementBootstrapNamespace: managementBootstrapNamespace,
+		ContainerInitImage:           containerInitImage,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Workspace")
 		os.Exit(1)

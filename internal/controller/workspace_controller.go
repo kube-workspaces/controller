@@ -121,6 +121,9 @@ type WorkspaceReconciler struct {
 	// ManagementBootstrapNamespace is an opt-in protected control-plane namespace.
 	// Empty disables management credential provisioning entirely.
 	ManagementBootstrapNamespace string
+	// ContainerInitImage is an operator-selected installer OCI image reference.
+	// Empty disables injected mode; baked-in mode needs no installer.
+	ContainerInitImage string
 }
 
 // +kubebuilder:rbac:groups=kubeworkspaces.io,resources=images,verbs=get;list;watch;create
@@ -177,6 +180,11 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	wsType := workspaceTypeOf(instance)
+	if wsType == WorkspaceTypeVM && instance.Spec.ContainerInit != nil {
+		err := fmt.Errorf("container initialization is only supported for container and scratch workspaces")
+		r.setNotReadyCondition(ctx, instance, "ContainerInitFailed", err.Error())
+		return ctrl.Result{}, err
+	}
 
 	// VM workspaces need the KubeVirt CRDs installed; degrade gracefully if absent.
 	if wsType == WorkspaceTypeVM {
@@ -187,7 +195,7 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 		if !installed {
 			log.Info("KubeVirt CRDs not installed; cannot run vm workspace", "name", instance.Name)
-			r.setCondition(ctx, instance, "Ready", "False", "KubeVirtNotInstalled",
+			r.setNotReadyCondition(ctx, instance, "KubeVirtNotInstalled",
 				"KubeVirt is not installed in this cluster")
 			return ctrl.Result{}, nil
 		}
@@ -215,7 +223,7 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	case WorkspaceTypeVM:
 		rr, p, err := r.reconcileVirtualMachine(ctx, instance)
 		if err != nil {
-			r.setCondition(ctx, instance, "Ready", "False", "VMReconcileFailed", err.Error())
+			r.setNotReadyCondition(ctx, instance, "VMReconcileFailed", err.Error())
 			ReconcileTotal.WithLabelValues("error").Inc()
 			ReconcileDuration.Observe(time.Since(reconcileStart).Seconds())
 			return ctrl.Result{}, err
@@ -334,9 +342,11 @@ func isNoMatchError(err error) bool {
 		strings.Contains(msg, "no kind is registered")
 }
 
-// setCondition writes a single status condition, replacing any of the same type.
-func (r *WorkspaceReconciler) setCondition(ctx context.Context, ws *kubeworkspacesiov1alpha1.Workspace,
-	condType, status, reason, message string) {
+// setNotReadyCondition writes failure diagnostics, replacing an existing Ready condition.
+func (r *WorkspaceReconciler) setNotReadyCondition(ctx context.Context, ws *kubeworkspacesiov1alpha1.Workspace,
+	reason, message string) {
+	const condType = "Ready"
+	const status = "False"
 
 	var conditions []kubeworkspacesiov1alpha1.WorkspaceCondition
 	for _, c := range ws.Status.Conditions {
@@ -369,6 +379,11 @@ func (r *WorkspaceReconciler) reconcileStatefulSet(ctx context.Context, instance
 	log := logf.FromContext(ctx)
 
 	ss := generateStatefulSet(instance)
+	if err := r.prepareContainerInit(ctx, instance, &ss.Spec.Template); err != nil {
+		r.setNotReadyCondition(ctx, instance, "ContainerInitFailed", err.Error())
+		return 0, nil, err
+	}
+	setPodTemplateHash(ss, &ss.Spec.Template)
 	if err := ctrl.SetControllerReference(instance, ss, r.Scheme); err != nil {
 		return 0, nil, err
 	}
@@ -419,6 +434,11 @@ func (r *WorkspaceReconciler) reconcileDeployment(ctx context.Context, instance 
 	log := logf.FromContext(ctx)
 
 	dep := generateDeployment(instance)
+	if err := r.prepareContainerInit(ctx, instance, &dep.Spec.Template); err != nil {
+		r.setNotReadyCondition(ctx, instance, "ContainerInitFailed", err.Error())
+		return 0, nil, err
+	}
+	setPodTemplateHash(dep, &dep.Spec.Template)
 	if err := ctrl.SetControllerReference(instance, dep, r.Scheme); err != nil {
 		return 0, nil, err
 	}
@@ -2084,6 +2104,7 @@ func (r *WorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.Secret{}).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.workspacesForContainerInitSecret)).
 		Watches(&kubeworkspacesiov1alpha1.SshKey{}, handler.EnqueueRequestsFromMapFunc(r.workspacesForSSHKey)).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(mapPodToRequest))
 

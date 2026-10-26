@@ -92,6 +92,30 @@ spec:
                   user-data (e.g. a user/password from DefaultUser/DefaultPassword) can be
                   seeded into the guest at first boot.
                 type: boolean
+              defaultCommand:
+                description: |-
+                  DefaultCommand is the explicit container entrypoint at workspace creation.
+                  Injected container-init requires a resolved command, not OCI discovery.
+                items:
+                  type: string
+                type: array
+              defaultContainerInit:
+                description: |-
+                  DefaultContainerInit opts container/scratch workspaces into initialization.
+                  DefaultUserData alone does not enable container initialization.
+                properties:
+                  mode:
+                    description: |-
+                      Mode selects normal startup, injected entrypoint wrapping, or data-only
+                      delivery to an image whose own entrypoint runs container-init.
+                    enum:
+                    - disabled
+                    - injected
+                    - baked-in
+                    type: string
+                required:
+                - mode
+                type: object
               defaultCredentials:
                 description: DefaultCredentials are the default login credentials
                   for this image.
@@ -1609,9 +1633,8 @@ spec:
                 type: string
               defaultUserData:
                 description: |-
-                  DefaultUserData is reserved user-data for the guest (cloud-init). Empty by
-                  default; later used to seed first-boot configuration when DefaultCloudInit
-                  is true. Not yet consumed by the controller.
+                  DefaultUserData is cloud-config for VM cloud-init or an explicitly enabled
+                  DefaultContainerInit. Container defaults are snapshotted at creation time.
                 type: string
               description:
                 description: Description of the image.

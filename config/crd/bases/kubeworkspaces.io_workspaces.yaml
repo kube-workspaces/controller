@@ -50,6 +50,51 @@ spec:
               WorkspaceSpec defines the desired state of Workspace.
               Modelled closely on Kubeflow Notebook spec - wraps a full PodSpec.
             properties:
+              containerInit:
+                description: |-
+                  ContainerInit is resolved at creation and applied to the main container.
+                  Direct Workspace CRs can supply it without an Image catalog lookup.
+                properties:
+                  mode:
+                    enum:
+                    - disabled
+                    - injected
+                    - baked-in
+                    type: string
+                  userData:
+                    description: |-
+                      UserData is an inline #cloud-config document, mounted through a generated
+                      Workspace-owned Secret. Maximum 256 KiB (also enforced in bytes at runtime).
+                    maxLength: 262144
+                    type: string
+                  userDataSecretRef:
+                    description: |-
+                      UserDataSecretRef references a same-namespace Secret with a user-data key.
+                      The referenced Secret is independently managed and is never adopted/deleted.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                    x-kubernetes-validations:
+                    - message: A user-data Secret name is required
+                      rule: has(self.name) && size(self.name) > 0
+                required:
+                - mode
+                type: object
+                x-kubernetes-validations:
+                - message: Choose inline userData or userDataSecretRef, not both
+                  rule: '!(has(self.userData) && has(self.userDataSecretRef))'
+                - message: Enabled container initialization requires user-data
+                  rule: self.mode == 'disabled' || (has(self.userData) && size(self.userData)
+                    > 0) || has(self.userDataSecretRef)
               executionRevocationEpoch:
                 default: 0
                 description: |-
@@ -8231,6 +8276,8 @@ spec:
             x-kubernetes-validations:
             - message: VM guest profiles require type vm
               rule: '!has(self.vmProfile) || self.type == ''vm'''
+            - message: Container initialization requires container or scratch type
+              rule: '!has(self.containerInit) || self.type != ''vm'''
             - message: The main image must match the resolved VM source
               rule: '!has(self.vmProfile) || (size(self.template.spec.containers)
                 == 1 && self.template.spec.containers[0].image == self.vmProfile.image)'

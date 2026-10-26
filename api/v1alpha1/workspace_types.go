@@ -24,8 +24,13 @@ import (
 // WorkspaceSpec defines the desired state of Workspace.
 // Modelled closely on Kubeflow Notebook spec - wraps a full PodSpec.
 // +kubebuilder:validation:XValidation:rule="!has(self.vmProfile) || self.type == 'vm'",message="VM guest profiles require type vm"
+// +kubebuilder:validation:XValidation:rule="!has(self.containerInit) || self.type != 'vm'",message="Container initialization requires container or scratch type"
 // +kubebuilder:validation:XValidation:rule="!has(self.vmProfile) || (size(self.template.spec.containers) == 1 && self.template.spec.containers[0].image == self.vmProfile.image)",message="The main image must match the resolved VM source"
 type WorkspaceSpec struct {
+	// ContainerInit is resolved at creation and applied to the main container.
+	// Direct Workspace CRs can supply it without an Image catalog lookup.
+	// +optional
+	ContainerInit *ContainerInitSpec `json:"containerInit,omitempty"`
 	// ExecutionRevocationEpoch requests a minimum execution epoch. The request
 	// itself is monotonic so a pending revocation cannot be undone before the
 	// controller acknowledges it in status. It never supplies authority.

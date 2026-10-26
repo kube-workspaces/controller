@@ -50,6 +50,14 @@ type ImageSpec struct {
 	// Default command-line args injected at workspace creation.
 	// +optional
 	DefaultArgs []string `json:"defaultArgs,omitempty"`
+	// DefaultCommand is the explicit container entrypoint at workspace creation.
+	// Injected container-init requires a resolved command, not OCI discovery.
+	// +optional
+	DefaultCommand []string `json:"defaultCommand,omitempty"`
+	// DefaultContainerInit opts container/scratch workspaces into initialization.
+	// DefaultUserData alone does not enable container initialization.
+	// +optional
+	DefaultContainerInit *ContainerInitDefaults `json:"defaultContainerInit,omitempty"`
 	// Default environment variables injected at workspace creation.
 	// Supports {{namespace}} and {{name}} placeholders.
 	// +optional
@@ -82,9 +90,8 @@ type ImageSpec struct {
 	// seeded into the guest at first boot.
 	// +optional
 	DefaultCloudInit bool `json:"defaultCloudInit,omitempty"`
-	// DefaultUserData is reserved user-data for the guest (cloud-init). Empty by
-	// default; later used to seed first-boot configuration when DefaultCloudInit
-	// is true. Not yet consumed by the controller.
+	// DefaultUserData is cloud-config for VM cloud-init or an explicitly enabled
+	// DefaultContainerInit. Container defaults are snapshotted at creation time.
 	// +optional
 	DefaultUserData string `json:"defaultUserData,omitempty"`
 	// DefaultHomedir is the default home directory for the default user.
